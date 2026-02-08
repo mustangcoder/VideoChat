@@ -15,3 +15,5 @@ uploads/
 backend/config.py
 
 .DS_Store
+.idea
+backend/data

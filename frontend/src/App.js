@@ -105,10 +105,16 @@ const ResultFileSelector = ({ files, selectedIds, onToggle, onMove }) => {
         );
     }
 
+    const selectedSet = new Set(selectedIds);
+    const orderedFiles = [
+        ...selectedIds.map(id => files.find(file => file.id === id)).filter(Boolean),
+        ...files.filter(file => !selectedSet.has(file.id)),
+    ];
+
     return (
         <div className="result-selector">
             <div className="result-selector-list">
-                {files.map(file => {
+                {orderedFiles.map(file => {
                     const selectedIndex = selectedIds.indexOf(file.id);
                     const isSelected = selectedIndex !== -1;
                     return (
@@ -145,6 +151,32 @@ const ResultFileSelector = ({ files, selectedIds, onToggle, onMove }) => {
     );
 };
 
+const ResizableTitle = (props) => {
+    const { onResize, width, children, ...restProps } = props;
+    if (!width) {
+        return <th {...restProps}>{children}</th>;
+    }
+    return (
+        <th {...restProps} style={{ ...restProps.style, width }}>
+            <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+                <div style={{ paddingRight: 8 }}>{children}</div>
+                <span
+                    onMouseDown={onResize}
+                    style={{
+                        position: 'absolute',
+                        right: 0,
+                        top: 0,
+                        height: '100%',
+                        width: 6,
+                        cursor: 'col-resize',
+                        userSelect: 'none',
+                    }}
+                />
+            </div>
+        </th>
+    );
+};
+
 function App() {
     const [summary, setSummary] = useState('');
     // eslint-disable-next-line no-unused-vars
@@ -159,6 +191,7 @@ function App() {
     const [generatingFiles, setGeneratingFiles] = useState(new Set());
     const abortControllers = useRef({});
     const jmInstanceRef = useRef(null);
+    const loadedChatKeysRef = useRef(new Set());
     const [uploadedFiles, setUploadedFiles] = useState([]);  // 存储上传的文件列表
     const [selectedFiles, setSelectedFiles] = useState([]);  // 存储选中的文件
     const [currentFile, setCurrentFile] = useState(null);    // 当前预览的文件
@@ -175,11 +208,107 @@ function App() {
     const [mergedSummaryLoading, setMergedSummaryLoading] = useState(false);
     const [mergedDetailedSummaryLoading, setMergedDetailedSummaryLoading] = useState(false);
     const [mergedMindmapLoading, setMergedMindmapLoading] = useState(false);
+    const [collapsedTranscriptions, setCollapsedTranscriptions] = useState(new Set());
+    const [now, setNow] = useState(Date.now());
+    const averageSpeedRef = useRef({ totalFactor: 0, count: 0 });
+    const [fileColumnWidths, setFileColumnWidths] = useState({
+        name: 420,
+        type: 120,
+        duration: 120,
+        status: 160,
+        remaining: 160,
+        action: 100,
+    });
 
     // 打印 uploadedFiles 的变化
     useEffect(() => {
         console.log('Uploaded Files:', uploadedFiles);
     }, [uploadedFiles]);
+
+    useEffect(() => {
+        const loadFiles = async () => {
+            try {
+                const response = await fetch('http://localhost:8000/api/files');
+                if (!response.ok) {
+                    throw new Error('加载文件列表失败');
+                }
+                const data = await response.json();
+                const files = (data.files || []).map(file => ({
+                    ...file,
+                    transcribeStartAt: null,
+                    transcribeProgress: null,
+                    transcribeProgressCurrent: null,
+                    transcribeProgressDuration: null,
+                    transcribeElapsed: typeof file.transcribeElapsed === 'number' ? file.transcribeElapsed : null,
+                }));
+                setUploadedFiles(files);
+                if (files.length > 0 && !currentFile) {
+                    setCurrentFile(files[0]);
+                    setMediaUrl({ url: files[0].url, type: files[0].type });
+                }
+            } catch (error) {
+                console.error('Failed to load files:', error);
+            }
+        };
+        loadFiles();
+    }, []);
+
+    useEffect(() => {
+        const timer = setInterval(() => {
+            setNow(Date.now());
+        }, 1000);
+        return () => clearInterval(timer);
+    }, []);
+
+    const transcribingIds = uploadedFiles.filter(file => file.status === 'transcribing').map(file => file.id);
+    const transcribingKey = transcribingIds.join('|');
+
+    useEffect(() => {
+        if (!transcribingKey) {
+            return;
+        }
+        let stopped = false;
+        const fetchProgress = async () => {
+            const ids = transcribingKey.split('|').filter(Boolean);
+            if (ids.length === 0) {
+                return;
+            }
+            await Promise.all(ids.map(async (fileId) => {
+                try {
+                    const response = await fetch(`http://localhost:8000/api/files/${fileId}/transcribe-progress`);
+                    if (!response.ok) {
+                        return;
+                    }
+                    const data = await response.json();
+                    if (stopped) {
+                        return;
+                    }
+                    const progressValue = typeof data.progress === 'number' ? data.progress : null;
+                    const currentValue = typeof data.current === 'number' ? data.current : null;
+                    const durationValue = typeof data.duration === 'number' ? data.duration : null;
+                    setUploadedFiles(prev => prev.map(file => file.id === fileId ? {
+                        ...file,
+                        transcribeProgress: progressValue,
+                        transcribeProgressCurrent: currentValue,
+                        transcribeProgressDuration: durationValue,
+                    } : file));
+                    setCurrentFile(prev => prev?.id === fileId ? {
+                        ...prev,
+                        transcribeProgress: progressValue,
+                        transcribeProgressCurrent: currentValue,
+                        transcribeProgressDuration: durationValue,
+                    } : prev);
+                } catch (error) {
+                }
+            }));
+        };
+        fetchProgress();
+        const timer = setInterval(fetchProgress, 1000);
+        return () => {
+            stopped = true;
+            clearInterval(timer);
+        };
+    }, [transcribingKey]);
 
     // 初始化 Mermaid
     React.useEffect(() => {
@@ -238,6 +367,48 @@ function App() {
         setMergedSummary('');
         setMergedDetailedSummary('');
         setMergedMindmapData(null);
+        if (!mergedSelectionKey) {
+            return;
+        }
+        fetch(`http://localhost:8000/api/merged-summary/${encodeURIComponent(mergedSelectionKey)}`)
+            .then(response => {
+                if (!response.ok) {
+                    return null;
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data?.summary) {
+                    setMergedSummary(data.summary);
+                }
+            })
+            .catch(() => {});
+        fetch(`http://localhost:8000/api/merged-detailed-summary/${encodeURIComponent(mergedSelectionKey)}`)
+            .then(response => {
+                if (!response.ok) {
+                    return null;
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data?.summary) {
+                    setMergedDetailedSummary(data.summary);
+                }
+            })
+            .catch(() => {});
+        fetch(`http://localhost:8000/api/merged-mindmap/${encodeURIComponent(mergedSelectionKey)}`)
+            .then(response => {
+                if (!response.ok) {
+                    return null;
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data?.mindmap) {
+                    setMergedMindmapData(data.mindmap);
+                }
+            })
+            .catch(() => {});
     }, [mergedSelectionKey]);
 
     const handleUpload = async (file) => {
@@ -251,33 +422,57 @@ function App() {
         }
 
         // 检查文件是否已经存在
-        const isExist = uploadedFiles.some(f => f.name === file.name);
+        const isExist = uploadedFiles.some(f => f.name === file.name && (f.fileSize || 0) === file.size);
         if (isExist) {
             message.warning('文件已存在');
             return false;
         }
 
-        // 创建文件的URL
-        const url = URL.createObjectURL(file);
-        const newFile = {
-            id: `${file.name}-${Date.now()}`,
-            name: file.name,
-            type: isVideo ? 'video' : 'audio',
-            url: url,
-            file: file,
-            status: 'waiting',
-            transcription: null,
-            summary: '',
-            detailedSummary: '',
-            mindmapData: null,
-        };
+        try {
+            const formData = new FormData();
+            formData.append('file', file, file.name);
 
-        setUploadedFiles(prev => [...prev, newFile]);
+            const response = await fetch('http://localhost:8000/api/files/upload', {
+                method: 'POST',
+                body: formData,
+            });
 
-        // 如果是第一个文件，动设置为当前预览文件
-        if (uploadedFiles.length === 0) {
-            setCurrentFile(newFile);
-            setMediaUrl({ url, type: isVideo ? 'video' : 'audio' });
+            if (!response.ok) {
+                throw new Error('上传失败');
+            }
+
+            const uploadResult = await response.json();
+            if (uploadResult?.skipped) {
+                message.info('文件已存在，已跳过上传');
+                return false;
+            }
+            const newFile = uploadResult?.file ? uploadResult.file : uploadResult;
+            newFile.transcribeStartAt = null;
+
+            setUploadedFiles(prev => [...prev, newFile]);
+
+            const mediaElement = document.createElement(isVideo ? 'video' : 'audio');
+            mediaElement.preload = 'metadata';
+            mediaElement.src = newFile.url;
+            mediaElement.onloadedmetadata = () => {
+                const duration = Number.isFinite(mediaElement.duration) ? mediaElement.duration : 0;
+                setUploadedFiles(prev => prev.map(f => f.id === newFile.id ? { ...f, duration } : f));
+                if (currentFile?.id === newFile.id) {
+                    setCurrentFile(prev => prev ? { ...prev, duration } : prev);
+                }
+            };
+            mediaElement.onerror = () => {
+                setUploadedFiles(prev => prev.map(f => f.id === newFile.id ? { ...f, duration: 0 } : f));
+            };
+
+            // 如果是第一个文件，动设置为当前预览文件
+            if (uploadedFiles.length === 0) {
+                setCurrentFile(newFile);
+                setMediaUrl({ url: newFile.url, type: newFile.type });
+            }
+        } catch (error) {
+            console.error('Upload failed:', error);
+            message.error('上传失败：' + error.message);
         }
 
         return false; // 阻止自动上传
@@ -312,28 +507,106 @@ function App() {
         return uploadedFiles.slice(start, end);
     };
 
+    const formatDuration = (seconds) => {
+        const safeSeconds = Math.max(0, Math.floor(seconds || 0));
+        const hours = Math.floor(safeSeconds / 3600);
+        const minutes = Math.floor((safeSeconds % 3600) / 60);
+        const secs = Math.floor(safeSeconds % 60);
+
+        if (hours > 0) {
+            return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+        }
+        return `${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    };
+
+    const getAverageSpeedFactor = () => {
+        const { totalFactor, count } = averageSpeedRef.current;
+        return count > 0 ? totalFactor / count : 1;
+    };
+
+    const getEstimatedTotalSeconds = (file) => {
+        if (!file?.duration || file.duration <= 0) return null;
+        return file.duration * getAverageSpeedFactor();
+    };
+
+    const getTranscribingRemainingSeconds = (file) => {
+        if (file?.transcribeProgressDuration != null && file?.transcribeProgressCurrent != null) {
+            return Math.max(file.transcribeProgressDuration - file.transcribeProgressCurrent, 0);
+        }
+        const total = getEstimatedTotalSeconds(file);
+        if (!total || !file?.transcribeStartAt) return null;
+        const elapsed = (now - file.transcribeStartAt) / 1000;
+        return Math.max(total - elapsed, 0);
+    };
+
+    const getQueueRemainingSeconds = (targetFile) => {
+        if (!selectedFiles.includes(targetFile.id)) return null;
+        let remaining = 0;
+        const currentTranscribing = uploadedFiles.find(f => f.status === 'transcribing');
+        const currentRemaining = currentTranscribing ? getTranscribingRemainingSeconds(currentTranscribing) : null;
+        for (const id of selectedFiles) {
+            const file = uploadedFiles.find(f => f.id === id);
+            if (!file) continue;
+            if (id === targetFile.id) {
+                const ownTotal = getEstimatedTotalSeconds(file);
+                return ownTotal == null ? null : remaining + ownTotal;
+            }
+            if (file.status === 'done' || file.status === 'error') continue;
+            if (file.status === 'transcribing') {
+                if (currentRemaining != null) remaining += currentRemaining;
+            } else if (file.status === 'waiting' || file.status === 'interrupted') {
+                const total = getEstimatedTotalSeconds(file);
+                if (total != null) remaining += total;
+            }
+        }
+        return null;
+    };
+
     // 文件列表列定
     const fileColumns = [
         {
             title: '文件名',
             dataIndex: 'name',
             key: 'name',
-            width: '70%',
+            width: fileColumnWidths.name,
         },
         {
             title: '类型',
             dataIndex: 'type',
             key: 'type',
+            width: fileColumnWidths.type,
             render: (type) => type === 'video' ? '视频' : '音频',
+        },
+        {
+            title: '耗时',
+            dataIndex: 'duration',
+            key: 'duration',
+            width: fileColumnWidths.duration,
+            render: (duration, record) => {
+                if (record.status === 'transcribing' && record.transcribeStartAt) {
+                    const elapsedSeconds = Math.max((now - record.transcribeStartAt) / 1000, 0);
+                    return formatDuration(elapsedSeconds);
+                }
+                if (record.transcribeElapsed != null) {
+                    return formatDuration(record.transcribeElapsed);
+                }
+                return '—';
+            },
         },
         {
             title: '状态',
             dataIndex: 'status',
             key: 'status',
-            render: (status) => {
+            width: fileColumnWidths.status,
+            render: (status, record) => {
                 switch (status) {
                     case 'waiting': return '等待转录';
-                    case 'transcribing': return <><SyncOutlined spin /> 转录中</>;
+                    case 'transcribing': {
+                        const progress = typeof record?.transcribeProgress === 'number'
+                            ? `${Math.min(100, Math.max(0, Math.round(record.transcribeProgress)))}%`
+                            : '';
+                        return <><SyncOutlined spin /> 转录中{progress ? ` ${progress}` : ''}</>;
+                    }
                     case 'done': return <span style={{ color: '#52c41a' }}>已完成</span>;
                     case 'error': return <span style={{ color: '#ff4d4f' }}>失败</span>;
                     case 'interrupted': return <span style={{ color: '#faad14' }}>转录中断</span>;
@@ -342,8 +615,28 @@ function App() {
             },
         },
         {
+            title: '预计剩余',
+            key: 'remaining',
+            width: fileColumnWidths.remaining,
+            render: (_, record) => {
+                if (record.status === 'done') return '已完成';
+                if (record.status === 'error') return '—';
+                if (record.status === 'transcribing') {
+                    const remaining = getTranscribingRemainingSeconds(record);
+                    return remaining == null ? '计算中' : formatDuration(Math.ceil(remaining));
+                }
+                if (record.status === 'waiting' || record.status === 'interrupted') {
+                    if (!selectedFiles.includes(record.id)) return '—';
+                    const queueRemaining = getQueueRemainingSeconds(record);
+                    return queueRemaining == null ? '计算中' : formatDuration(Math.ceil(queueRemaining));
+                }
+                return '—';
+            },
+        },
+        {
             title: '操作',
             key: 'action',
+            width: fileColumnWidths.action,
             render: (_, record) => (
                 <Button
                     type="text"
@@ -359,24 +652,54 @@ function App() {
                 </Button>
             ),
         },
-    ];
+    ].map((column) => ({
+        ...column,
+        onHeaderCell: () => ({
+            width: column.width,
+            onResize: (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                const startX = event.clientX;
+                const startWidth = fileColumnWidths[column.key] || 120;
+                const onMouseMove = (moveEvent) => {
+                    const nextWidth = Math.max(80, startWidth + moveEvent.clientX - startX);
+                    setFileColumnWidths((prev) => ({ ...prev, [column.key]: nextWidth }));
+                };
+                const onMouseUp = () => {
+                    document.removeEventListener('mousemove', onMouseMove);
+                    document.removeEventListener('mouseup', onMouseUp);
+                };
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+            },
+        }),
+    }));
 
     // 处理文件删除
     const handleFileDelete = (fileId) => {
-        setUploadedFiles(prev => prev.filter(file => file.id !== fileId));
-        setSelectedFiles(prev => prev.filter(id => id !== fileId));
+        const removeLocal = () => {
+            setUploadedFiles(prev => prev.filter(file => file.id !== fileId));
+            setSelectedFiles(prev => prev.filter(id => id !== fileId));
 
-        if (currentFile?.id === fileId) {
-            const remainingFiles = uploadedFiles.filter(file => file.id !== fileId);
-            const nextFile = remainingFiles[0];
-            if (nextFile) {
-                setCurrentFile(nextFile);
-                setMediaUrl({ url: nextFile.url, type: nextFile.type });
-            } else {
-                setCurrentFile(null);
-                setMediaUrl(null);
+            if (currentFile?.id === fileId) {
+                const remainingFiles = uploadedFiles.filter(file => file.id !== fileId);
+                const nextFile = remainingFiles[0];
+                if (nextFile) {
+                    setCurrentFile(nextFile);
+                    setMediaUrl({ url: nextFile.url, type: nextFile.type });
+                } else {
+                    setCurrentFile(null);
+                    setMediaUrl(null);
+                }
             }
-        }
+        };
+
+        fetch(`http://localhost:8000/api/files/${fileId}`, { method: 'DELETE' })
+            .then(() => removeLocal())
+            .catch((error) => {
+                console.error('Failed to delete file:', error);
+                message.error('删除失败：' + error.message);
+            });
     };
 
     // 修改文件预览函数
@@ -404,9 +727,26 @@ function App() {
                 // 只将正在转录的文件状态改为中断
                 setUploadedFiles(prev => prev.map(f =>
                     f.status === 'transcribing'
-                        ? { ...f, status: 'interrupted' }
+                        ? {
+                            ...f,
+                            status: 'interrupted',
+                            transcribeStartAt: null,
+                            transcribeProgress: null,
+                            transcribeProgressCurrent: null,
+                            transcribeProgressDuration: null,
+                            transcribeElapsed: f.transcribeStartAt ? Math.max((Date.now() - f.transcribeStartAt) / 1000, 0) : f.transcribeElapsed ?? null,
+                        }
                         : f
                 ));
+                setCurrentFile(prev => prev?.status === 'transcribing' ? {
+                    ...prev,
+                    status: 'interrupted',
+                    transcribeStartAt: null,
+                    transcribeProgress: null,
+                    transcribeProgressCurrent: null,
+                    transcribeProgressDuration: null,
+                    transcribeElapsed: prev?.transcribeStartAt ? Math.max((Date.now() - prev.transcribeStartAt) / 1000, 0) : prev?.transcribeElapsed ?? null,
+                } : prev);
 
                 message.success('已停止转录');
             } catch (error) {
@@ -433,10 +773,27 @@ function App() {
                 if (abortTranscribing) {
                     // 只将当前在转的文件状态改为中断
                     setUploadedFiles(prev => prev.map(f =>
-                        f.status === 'transcribing'
-                            ? { ...f, status: 'interrupted' }
+                    f.status === 'transcribing'
+                        ? {
+                            ...f,
+                            status: 'interrupted',
+                            transcribeStartAt: null,
+                            transcribeProgress: null,
+                            transcribeProgressCurrent: null,
+                            transcribeProgressDuration: null,
+                            transcribeElapsed: f.transcribeStartAt ? Math.max((Date.now() - f.transcribeStartAt) / 1000, 0) : f.transcribeElapsed ?? null,
+                        }
                             : f
                     ));
+                setCurrentFile(prev => prev?.status === 'transcribing' ? {
+                    ...prev,
+                    status: 'interrupted',
+                    transcribeStartAt: null,
+                    transcribeProgress: null,
+                    transcribeProgressCurrent: null,
+                    transcribeProgressDuration: null,
+                    transcribeElapsed: prev?.transcribeStartAt ? Math.max((Date.now() - prev.transcribeStartAt) / 1000, 0) : prev?.transcribeElapsed ?? null,
+                } : prev);
                     break;
                 }
 
@@ -451,16 +808,20 @@ function App() {
 
                 // 更新文件状态为转录中
                 setUploadedFiles(prev => prev.map(f =>
-                    f.id === fileId ? { ...f, status: 'transcribing' } : f
+                    f.id === fileId ? {
+                        ...f,
+                        status: 'transcribing',
+                        transcribeStartAt: Date.now(),
+                        transcribeProgress: 0,
+                        transcribeProgressCurrent: 0,
+                        transcribeProgressDuration: null,
+                        transcribeElapsed: null,
+                    } : f
                 ));
 
                 try {
-                    const formData = new FormData();
-                    formData.append('file', file.file, file.name);
-
-                    const response = await fetch('http://localhost:8000/api/upload', {
+                    const response = await fetch(`http://localhost:8000/api/files/${fileId}/transcribe`, {
                         method: 'POST',
-                        body: formData,
                     });
 
                     const data = await response.json();
@@ -469,7 +830,15 @@ function App() {
                         // 处理转录中断的情况，只更新当前文件状态
                         setUploadedFiles(prev => prev.map(f =>
                             f.id === fileId
-                                ? { ...f, status: 'interrupted' }
+                                ? {
+                                    ...f,
+                                    status: 'interrupted',
+                                    transcribeStartAt: null,
+                                    transcribeProgress: null,
+                                    transcribeProgressCurrent: null,
+                                    transcribeProgressDuration: null,
+                                    transcribeElapsed: f.transcribeStartAt ? Math.max((Date.now() - f.transcribeStartAt) / 1000, 0) : f.transcribeElapsed ?? null,
+                                }
                                 : f
                         ));
                         break; // 中断后续文件的转录
@@ -480,12 +849,26 @@ function App() {
                     }
 
                     if (!abortTranscribing) {  // 添加检查，确保没有中断请求
+                        if (file?.transcribeStartAt && file.duration) {
+                            const elapsedSeconds = (Date.now() - file.transcribeStartAt) / 1000;
+                            if (elapsedSeconds > 0) {
+                                averageSpeedRef.current = {
+                                    totalFactor: averageSpeedRef.current.totalFactor + (elapsedSeconds / file.duration),
+                                    count: averageSpeedRef.current.count + 1
+                                };
+                            }
+                        }
                         setUploadedFiles(prev => {
                             const newFiles = prev.map(f =>
                                 f.id === fileId ? {
                                     ...f,
                                     status: 'done',
-                                    transcription: data.transcription
+                                    transcription: data.transcription,
+                                    transcribeStartAt: null,
+                                    transcribeProgress: 100,
+                                    transcribeProgressCurrent: f.transcribeProgressDuration ?? f.duration ?? f.transcribeProgressCurrent ?? null,
+                                    transcribeProgressDuration: f.transcribeProgressDuration ?? f.duration ?? null,
+                                    transcribeElapsed: f.transcribeStartAt ? Math.max((Date.now() - f.transcribeStartAt) / 1000, 0) : f.transcribeElapsed ?? null,
                                 } : f
                             );
                             return newFiles;
@@ -495,14 +878,27 @@ function App() {
                             setCurrentFile(prev => ({
                                 ...prev,
                                 status: 'done',
-                                transcription: data.transcription
+                                transcription: data.transcription,
+                                transcribeStartAt: null,
+                                transcribeProgress: 100,
+                                transcribeProgressCurrent: prev?.transcribeProgressDuration ?? prev?.duration ?? prev?.transcribeProgressCurrent ?? null,
+                                transcribeProgressDuration: prev?.transcribeProgressDuration ?? prev?.duration ?? null,
+                                transcribeElapsed: prev?.transcribeStartAt ? Math.max((Date.now() - prev.transcribeStartAt) / 1000, 0) : prev?.transcribeElapsed ?? null,
                             }));
                         }
                     }
                 } catch (error) {
                     if (!abortTranscribing) {  // 添加检查，确保没有中断请求
                         setUploadedFiles(prev => prev.map(f =>
-                            f.id === fileId ? { ...f, status: 'error' } : f
+                            f.id === fileId ? {
+                                ...f,
+                                status: 'error',
+                                transcribeStartAt: null,
+                                transcribeProgress: null,
+                                transcribeProgressCurrent: null,
+                                transcribeProgressDuration: null,
+                                transcribeElapsed: f.transcribeStartAt ? Math.max((Date.now() - f.transcribeStartAt) / 1000, 0) : f.transcribeElapsed ?? null,
+                            } : f
                         ));
                         message.error(`文件 "${file.name}" 转录失败：${error.message}`);
                     }
@@ -538,7 +934,6 @@ function App() {
             return;
         }
 
-        const text = file.transcription.map(item => item.text).join('\n');
         try {
             setSummaryLoadingFiles(prev => new Set([...prev, fileId]));
 
@@ -551,10 +946,8 @@ function App() {
             // 强制更新 uploadedFiles 以触发重渲染
             setUploadedFiles([...uploadedFiles]);
 
-            const response = await fetch('http://localhost:8000/api/summary', {
+            const response = await fetch(`http://localhost:8000/api/files/${fileId}/summary`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: text }),
             });
 
             if (!response.ok) {
@@ -603,7 +996,6 @@ function App() {
             return;
         }
 
-        const text = file.transcription.map(item => item.text).join('\n');
         try {
             // 将当前文件添加到正在生成的集合中
             setMindmapLoadingFiles(prev => new Set([...prev, fileId]));
@@ -617,10 +1009,8 @@ function App() {
             // 强制更新 uploadedFiles 以触发重渲染
             setUploadedFiles([...uploadedFiles]);
 
-            const response = await fetch('http://localhost:8000/api/mindmap', {
+            const response = await fetch(`http://localhost:8000/api/files/${fileId}/mindmap`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: text }),
             });
 
             if (!response.ok) {
@@ -711,6 +1101,43 @@ function App() {
         }
     }, []);
 
+    const persistChatHistory = async (contextKey, messages) => {
+        if (!contextKey) return;
+        try {
+            await fetch('http://localhost:8000/api/chat-history', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ contextKey, messages }),
+            });
+        } catch (error) {}
+    };
+
+    const loadChatHistory = async (contextKey) => {
+        if (!contextKey || loadedChatKeysRef.current.has(contextKey)) return;
+        try {
+            const response = await fetch(`http://localhost:8000/api/chat-history/${encodeURIComponent(contextKey)}`);
+            loadedChatKeysRef.current.add(contextKey);
+            if (!response.ok) {
+                return;
+            }
+            const data = await response.json();
+            if (Array.isArray(data?.messages)) {
+                setMessagesByFile(prev => ({ ...prev, [contextKey]: data.messages }));
+            }
+        } catch (error) {
+            loadedChatKeysRef.current.add(contextKey);
+        }
+    };
+
+    useEffect(() => {
+        if (mergedChatKey) {
+            loadChatHistory(mergedChatKey);
+        }
+        resultSelection.forEach(id => {
+            loadChatHistory(id);
+        });
+    }, [mergedChatKey, resultSelection]);
+
     // 修改发送消息函数
     const handleSendMessage = async (targetId, contextText) => {
         const file = contextText ? null : uploadedFiles.find(f => f.id === targetId);
@@ -723,19 +1150,23 @@ function App() {
                 next.delete(targetId);
                 return next;
             });
-            setMessagesByFile(prev => {
-                const fileMessages = [...(prev[targetId] || [])];
-                if (fileMessages.length > 0) {
-                    const lastMessage = fileMessages[fileMessages.length - 1];
-                    if (lastMessage.role === 'assistant') {
-                        fileMessages[fileMessages.length - 1] = {
+            const currentMessages = messagesByFile[targetId] || [];
+            let updatedMessages = currentMessages;
+            if (currentMessages.length > 0) {
+                const lastIndex = currentMessages.length - 1;
+                const lastMessage = currentMessages[lastIndex];
+                if (lastMessage.role === 'assistant') {
+                    updatedMessages = [
+                        ...currentMessages.slice(0, lastIndex),
+                        {
                             ...lastMessage,
                             content: `${lastMessage.content}\n\n*[已停止生成]*`
-                        };
-                    }
+                        }
+                    ];
                 }
-                return { ...prev, [targetId]: fileMessages };
-            });
+            }
+            setMessagesByFile(prev => ({ ...prev, [targetId]: updatedMessages }));
+            persistChatHistory(targetId, updatedMessages);
             return;
         }
 
@@ -797,6 +1228,12 @@ function App() {
                     throw error;
                 }
             }
+            const finalMessages = [...currentMessages, { role: 'assistant', content: aiResponse }];
+            setMessagesByFile(prev => ({
+                ...prev,
+                [targetId]: finalMessages
+            }));
+            await persistChatHistory(targetId, finalMessages);
         } catch (error) {
             if (error.name === 'AbortError') {
                 message.info('已停止生成');
@@ -937,7 +1374,6 @@ function App() {
             return;
         }
 
-        const text = file.transcription.map(item => item.text).join('\n');
         try {
             setDetailedSummaryLoadingFiles(prev => new Set([...prev, fileId]));
 
@@ -950,10 +1386,8 @@ function App() {
             // 强制更新 uploadedFiles 以触发重渲染
             setUploadedFiles([...uploadedFiles]);
 
-            const response = await fetch('http://localhost:8000/api/detailed-summary', {
+            const response = await fetch(`http://localhost:8000/api/files/${fileId}/detailed-summary`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: text }),
             });
 
             if (!response.ok) {
@@ -1025,6 +1459,13 @@ function App() {
                 summaryText += chunk;
                 setMergedSummary(summaryText);
             }
+            if (mergedSelectionKey && summaryText) {
+                fetch('http://localhost:8000/api/merged-summary', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ selectionKey: mergedSelectionKey, summary: summaryText }),
+                }).catch(() => {});
+            }
         } catch (error) {
             console.error('Merged summary generation failed:', error);
             message.error('生成合并总结失败：' + error.message);
@@ -1069,6 +1510,13 @@ function App() {
                 summaryText += chunk;
                 setMergedDetailedSummary(summaryText);
             }
+            if (mergedSelectionKey && summaryText) {
+                fetch('http://localhost:8000/api/merged-detailed-summary', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ selectionKey: mergedSelectionKey, summary: summaryText }),
+                }).catch(() => {});
+            }
         } catch (error) {
             console.error('Merged detailed summary generation failed:', error);
             message.error('生成合并详细总结失败：' + error.message);
@@ -1103,6 +1551,13 @@ function App() {
 
             const data = await response.json();
             setMergedMindmapData(data.mindmap);
+            if (mergedSelectionKey && data?.mindmap) {
+                fetch('http://localhost:8000/api/merged-mindmap', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ selectionKey: mergedSelectionKey, mindmap: data.mindmap }),
+                }).catch(() => {});
+            }
         } catch (error) {
             console.error('Merged mindmap generation failed:', error);
             message.error('生成合并思维导图失败：' + error.message);
@@ -1167,24 +1622,33 @@ function App() {
             return;
         }
 
-        // 删除选中的文件
-        setUploadedFiles(prev => prev.filter(file => !selectedFiles.includes(file.id)));
-        setSelectedFiles([]); // 清空选中状态
+        Promise.all(
+            selectedFiles.map(fileId =>
+                fetch(`http://localhost:8000/api/files/${fileId}`, { method: 'DELETE' })
+            )
+        )
+            .then(() => {
+                setUploadedFiles(prev => prev.filter(file => !selectedFiles.includes(file.id)));
+                setSelectedFiles([]);
 
-        // 如果当前预览的文件被删除，则切换到第一个可用文件
-        if (currentFile && selectedFiles.includes(currentFile.id)) {
-            const remainingFiles = uploadedFiles.filter(file => !selectedFiles.includes(file.id));
-            const nextFile = remainingFiles[0];
-            if (nextFile) {
-                setCurrentFile(nextFile);
-                setMediaUrl({ url: nextFile.url, type: nextFile.type });
-            } else {
-                setCurrentFile(null);
-                setMediaUrl(null);
-            }
-        }
+                if (currentFile && selectedFiles.includes(currentFile.id)) {
+                    const remainingFiles = uploadedFiles.filter(file => !selectedFiles.includes(file.id));
+                    const nextFile = remainingFiles[0];
+                    if (nextFile) {
+                        setCurrentFile(nextFile);
+                        setMediaUrl({ url: nextFile.url, type: nextFile.type });
+                    } else {
+                        setCurrentFile(null);
+                        setMediaUrl(null);
+                    }
+                }
 
-        message.success('已删除选中的文件');
+                message.success('已删除选中的文件');
+            })
+            .catch((error) => {
+                console.error('Failed to delete files:', error);
+                message.error('删除失败：' + error.message);
+            });
     };
 
     const transcribedFiles = uploadedFiles.filter(hasTranscription);
@@ -1222,6 +1686,18 @@ function App() {
             if (target < 0 || target >= next.length) return next;
             const [item] = next.splice(idx, 1);
             next.splice(target, 0, item);
+            return next;
+        });
+    };
+
+    const toggleTranscriptionCollapse = (fileId) => {
+        setCollapsedTranscriptions(prev => {
+            const next = new Set(prev);
+            if (next.has(fileId)) {
+                next.delete(fileId);
+            } else {
+                next.add(fileId);
+            }
             return next;
         });
     };
@@ -1283,16 +1759,24 @@ function App() {
                                 <Card key={fid} style={{ marginTop: 8 }}>
                                     <div className="current-file-tip">
                                         <span>文件：{file.name}</span>
+                                        <Button
+                                            size="small"
+                                            onClick={() => toggleTranscriptionCollapse(fid)}
+                                        >
+                                            {collapsedTranscriptions.has(fid) ? '展开' : '折叠'}
+                                        </Button>
                                     </div>
-                                    <Table
-                                        dataSource={file.transcription.map((item, index) => ({
-                                            ...item,
-                                            key: index,
-                                        }))}
-                                        columns={transcriptionColumns}
-                                        pagination={false}
-                                        size="small"
-                                    />
+                                    {!collapsedTranscriptions.has(fid) && (
+                                        <Table
+                                            dataSource={file.transcription.map((item, index) => ({
+                                                ...item,
+                                                key: index,
+                                            }))}
+                                            columns={transcriptionColumns}
+                                            pagination={false}
+                                            size="small"
+                                        />
+                                    )}
                                 </Card>
                             );
                         })
@@ -1793,6 +2277,12 @@ function App() {
                             </div>
                         </div>
                         <Table
+                            components={{
+                                header: {
+                                    cell: ResizableTitle,
+                                },
+                            }}
+                            tableLayout="fixed"
                             rowSelection={{
                                 selectedRowKeys: selectedFiles,
                                 onChange: handleFileSelect,
