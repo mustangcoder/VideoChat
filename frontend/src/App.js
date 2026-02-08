@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Layout, Upload, Button, Input, Card, message, Table, Tabs, Pagination, Checkbox } from 'antd';
 import { UploadOutlined, SendOutlined, SoundOutlined, SyncOutlined, DownloadOutlined, CopyOutlined, StopOutlined, DeleteOutlined, GithubOutlined, ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
@@ -242,6 +242,8 @@ function App() {
     const [now, setNow] = useState(Date.now());
     const averageSpeedRef = useRef({ totalFactor: 0, count: 0 });
     const emptyMessagesRef = useRef([]);
+    const [activeFeatureTab, setActiveFeatureTab] = useState('1');
+    const [activeMediaTab, setActiveMediaTab] = useState('1');
     const [fileColumnWidths, setFileColumnWidths] = useState({
         name: 420,
         type: 120,
@@ -284,15 +286,18 @@ function App() {
         loadFiles();
     }, []);
 
+    const transcribingIds = uploadedFiles.filter(file => file.status === 'transcribing').map(file => file.id);
+    const transcribingKey = transcribingIds.join('|');
+
     useEffect(() => {
+        if (!transcribingKey) {
+            return undefined;
+        }
         const timer = setInterval(() => {
             setNow(Date.now());
         }, 1000);
         return () => clearInterval(timer);
-    }, []);
-
-    const transcribingIds = uploadedFiles.filter(file => file.status === 'transcribing').map(file => file.id);
-    const transcribingKey = transcribingIds.join('|');
+    }, [transcribingKey]);
 
     useEffect(() => {
         if (!transcribingKey) {
@@ -391,8 +396,10 @@ function App() {
         });
     }, [uploadedFiles, currentFile]);
 
-    const mergedSelectionKey = resultSelection.join('|');
-    const mergedChatKey = mergedSelectionKey ? `merged:${mergedSelectionKey}` : '';
+    const mergedSelectionKey = useMemo(() => resultSelection.join('|'), [resultSelection]);
+    const mergedChatKey = useMemo(() => (
+        mergedSelectionKey ? `merged:${mergedSelectionKey}` : ''
+    ), [mergedSelectionKey]);
 
     useEffect(() => {
         setMergedSummary('');
@@ -1682,10 +1689,14 @@ function App() {
             });
     };
 
-    const transcribedFiles = uploadedFiles.filter(hasTranscription);
-    const mergedTranscribedFiles = resultSelection
-        .map(id => uploadedFiles.find(file => file.id === id))
-        .filter(file => file && hasTranscription(file));
+    const transcribedFiles = useMemo(() => (
+        uploadedFiles.filter(hasTranscription)
+    ), [uploadedFiles]);
+    const mergedTranscribedFiles = useMemo(() => (
+        resultSelection
+            .map(id => uploadedFiles.find(file => file.id === id))
+            .filter(file => file && hasTranscription(file))
+    ), [resultSelection, uploadedFiles]);
     const mergedMessages = messagesByFile[mergedChatKey] || emptyMessagesRef.current;
 
     const buildMergedText = (files) => {
@@ -1696,8 +1707,12 @@ function App() {
         }).join('\n\n');
     };
 
-    const mergedText = buildMergedText(mergedTranscribedFiles);
-    const mergedIdSuffix = mergedSelectionKey ? mergedSelectionKey.split('|').join('-') : 'empty';
+    const mergedText = useMemo(() => (
+        buildMergedText(mergedTranscribedFiles)
+    ), [mergedTranscribedFiles]);
+    const mergedIdSuffix = useMemo(() => (
+        mergedSelectionKey ? mergedSelectionKey.split('|').join('-') : 'empty'
+    ), [mergedSelectionKey]);
 
     const handleToggleResultSelection = (id, checked) => {
         setResultSelection(prev => {
@@ -2339,13 +2354,23 @@ function App() {
                 <div className="main-layout">
                     <div className="media-panel">
                         <Card className="media-card">
-                            <Tabs items={leftTabItems} />
+                            <Tabs
+                                items={leftTabItems}
+                                activeKey={activeMediaTab}
+                                onChange={setActiveMediaTab}
+                                destroyInactiveTabPane
+                            />
                         </Card>
                     </div>
 
                     <div className="feature-panel">
                         <Card className="feature-card">
-                            <Tabs items={tabItems} />
+                            <Tabs
+                                items={tabItems}
+                                activeKey={activeFeatureTab}
+                                onChange={setActiveFeatureTab}
+                                destroyInactiveTabPane
+                            />
                         </Card>
                     </div>
                 </div>
