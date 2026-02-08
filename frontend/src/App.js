@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Layout, Upload, Button, Input, Card, message, Table, Tabs, Pagination, Checkbox } from 'antd';
 import { UploadOutlined, SendOutlined, SoundOutlined, SyncOutlined, DownloadOutlined, CopyOutlined, StopOutlined, DeleteOutlined, GithubOutlined, ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
@@ -10,7 +10,7 @@ import 'jsmind/style/jsmind.css';
 const { TextArea } = Input;
 
 // 修改内容展示组件
-const SummaryContent = ({ fileId, content, isLoading }) => {
+const SummaryContent = React.memo(({ fileId, content, isLoading }) => {
     const containerId = `summary-content-${fileId}`;
 
     // 直接使用传入的 content，不再使用本地状态
@@ -19,9 +19,9 @@ const SummaryContent = ({ fileId, content, isLoading }) => {
             <ReactMarkdown>{content || ''}</ReactMarkdown>
         </div>
     );
-};
+});
 
-const DetailedSummaryContent = ({ fileId, content, isLoading }) => {
+const DetailedSummaryContent = React.memo(({ fileId, content, isLoading }) => {
     const containerId = `detailed-summary-content-${fileId}`;
 
     return (
@@ -29,9 +29,9 @@ const DetailedSummaryContent = ({ fileId, content, isLoading }) => {
             <ReactMarkdown>{content || ''}</ReactMarkdown>
         </div>
     );
-};
+});
 
-const MindmapContent = ({ fileId, content, isLoading }) => {
+const MindmapContent = React.memo(({ fileId, content, isLoading }) => {
     const containerId = `mindmap-container-${fileId}`;
 
     useEffect(() => {
@@ -94,9 +94,9 @@ const MindmapContent = ({ fileId, content, isLoading }) => {
 
     // 如果既不是加载中也没有内容，返回空容器
     return <div id={containerId} className="mindmap-container" />;
-};
+});
 
-const ResultFileSelector = ({ files, selectedIds, onToggle, onMove }) => {
+const ResultFileSelector = React.memo(({ files, selectedIds, onToggle, onMove }) => {
     if (files.length === 0) {
         return (
             <div className="empty-state">
@@ -131,17 +131,19 @@ const ResultFileSelector = ({ files, selectedIds, onToggle, onMove }) => {
                                     icon={<ArrowUpOutlined />}
                                     disabled={!isSelected || selectedIndex === 0}
                                     onClick={() => onMove(file.id, 'up')}
-                                >
-                                    上移
-                                </Button>
+                                    type="text"
+                                    aria-label="上移"
+                                    title="上移"
+                                />
                                 <Button
                                     size="small"
                                     icon={<ArrowDownOutlined />}
                                     disabled={!isSelected || selectedIndex === selectedIds.length - 1}
                                     onClick={() => onMove(file.id, 'down')}
-                                >
-                                    下移
-                                </Button>
+                                    type="text"
+                                    aria-label="下移"
+                                    title="下移"
+                                />
                             </div>
                         </div>
                     );
@@ -149,7 +151,35 @@ const ResultFileSelector = ({ files, selectedIds, onToggle, onMove }) => {
             </div>
         </div>
     );
-};
+});
+
+const ChatMessages = React.memo(({ messages, onCopy }) => (
+    <div className="chat-messages">
+        {messages.map((msg, index) => (
+            <div
+                key={index}
+                className={`message-wrapper ${msg.role === 'user' ? 'user' : 'assistant'}`}
+            >
+                <div className="message-bubble">
+                    <div className="message-content">
+                        <ReactMarkdown>{msg.content}</ReactMarkdown>
+                    </div>
+                    <Button
+                        type="text"
+                        className="copy-button"
+                        icon={<CopyOutlined />}
+                        onClick={() => onCopy(msg.content)}
+                    >
+                        复制
+                    </Button>
+                </div>
+                <div className="message-time">
+                    {new Date().toLocaleTimeString()}
+                </div>
+            </div>
+        ))}
+    </div>
+));
 
 const ResizableTitle = (props) => {
     const { onResize, width, children, ...restProps } = props;
@@ -211,6 +241,7 @@ function App() {
     const [collapsedTranscriptions, setCollapsedTranscriptions] = useState(new Set());
     const [now, setNow] = useState(Date.now());
     const averageSpeedRef = useRef({ totalFactor: 0, count: 0 });
+    const emptyMessagesRef = useRef([]);
     const [fileColumnWidths, setFileColumnWidths] = useState({
         name: 420,
         type: 120,
@@ -1605,7 +1636,7 @@ function App() {
     };
 
     // 添加复制功能
-    const handleCopyMessage = (content) => {
+    const handleCopyMessage = useCallback((content) => {
         navigator.clipboard.writeText(content)
             .then(() => {
                 message.success('复制成功');
@@ -1613,7 +1644,7 @@ function App() {
             .catch(() => {
                 message.error('复制失败');
             });
-    };
+    }, []);
 
     // 添加全部删除的处理函数
     const handleDeleteAll = () => {
@@ -1655,6 +1686,7 @@ function App() {
     const mergedTranscribedFiles = resultSelection
         .map(id => uploadedFiles.find(file => file.id === id))
         .filter(file => file && hasTranscription(file));
+    const mergedMessages = messagesByFile[mergedChatKey] || emptyMessagesRef.current;
 
     const buildMergedText = (files) => {
         if (files.length === 0) return '';
@@ -1757,14 +1789,17 @@ function App() {
                             if (!file || !hasTranscription(file)) return null;
                             return (
                                 <Card key={fid} style={{ marginTop: 8 }}>
-                                    <div className="current-file-tip">
-                                        <span>文件：{file.name}</span>
+                                    <div className="current-file-tip" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'nowrap' }}>
                                         <Button
                                             size="small"
+                                            type="text"
                                             onClick={() => toggleTranscriptionCollapse(fid)}
                                         >
                                             {collapsedTranscriptions.has(fid) ? '展开' : '折叠'}
                                         </Button>
+                                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
+                                            文件：{file.name}
+                                        </span>
                                     </div>
                                     {!collapsedTranscriptions.has(fid) && (
                                         <Table
@@ -2070,31 +2105,7 @@ function App() {
                                 <div className="current-file-tip">
                                     <span>合并结果（{mergedTranscribedFiles.length} 个文件）</span>
                                 </div>
-                                <div className="chat-messages">
-                                    {(messagesByFile[mergedChatKey] || []).map((msg, index) => (
-                                        <div
-                                            key={index}
-                                            className={`message-wrapper ${msg.role === 'user' ? 'user' : 'assistant'}`}
-                                        >
-                                            <div className="message-bubble">
-                                                <div className="message-content">
-                                                    <ReactMarkdown>{msg.content}</ReactMarkdown>
-                                                </div>
-                                                <Button
-                                                    type="text"
-                                                    className="copy-button"
-                                                    icon={<CopyOutlined />}
-                                                    onClick={() => handleCopyMessage(msg.content)}
-                                                >
-                                                    复制
-                                                </Button>
-                                            </div>
-                                            <div className="message-time">
-                                                {new Date().toLocaleTimeString()}
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
+                                <ChatMessages messages={mergedMessages} onCopy={handleCopyMessage} />
                                 <div className="chat-input-area">
                                     <TextArea
                                         value={inputMessages[mergedChatKey] || ''}
@@ -2125,7 +2136,7 @@ function App() {
                             {resultSelection.map(fid => {
                                 const file = uploadedFiles.find(f => f.id === fid);
                                 if (!file || !hasTranscription(file)) return null;
-                                const messages = messagesByFile[fid] || [];
+                                const messages = messagesByFile[fid] || emptyMessagesRef.current;
                                 const inputVal = inputMessages[fid] || '';
                                 const generating = generatingFiles.has(fid);
                                 return (
@@ -2133,31 +2144,7 @@ function App() {
                                         <div className="current-file-tip">
                                             <span>文件：{file.name}</span>
                                         </div>
-                                        <div className="chat-messages">
-                                            {messages.map((msg, index) => (
-                                                <div
-                                                    key={index}
-                                                    className={`message-wrapper ${msg.role === 'user' ? 'user' : 'assistant'}`}
-                                                >
-                                                    <div className="message-bubble">
-                                                        <div className="message-content">
-                                                            <ReactMarkdown>{msg.content}</ReactMarkdown>
-                                                        </div>
-                                                        <Button
-                                                            type="text"
-                                                            className="copy-button"
-                                                            icon={<CopyOutlined />}
-                                                            onClick={() => handleCopyMessage(msg.content)}
-                                                        >
-                                                            复制
-                                                        </Button>
-                                                    </div>
-                                                    <div className="message-time">
-                                                        {new Date().toLocaleTimeString()}
-                                                    </div>
-                                                </div>
-                                            ))}
-                                        </div>
+                                        <ChatMessages messages={messages} onCopy={handleCopyMessage} />
                                         <div className="chat-input-area">
                                             <TextArea
                                                 value={inputVal}

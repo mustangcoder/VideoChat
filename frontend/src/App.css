@@ -448,8 +448,15 @@ jmnode.important {
   background: #e6f7ff;
 }
 
+.result-selector-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+
 .result-selector-actions .ant-btn {
-  padding: 0 8px;
+  padding: 0 6px;
 }
 
 /* 简单总结样式 */
