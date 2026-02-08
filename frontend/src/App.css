@@ -292,6 +292,7 @@ jmnode.important {
 .feature-card .ant-tabs-content-holder {
   flex: 1;
   overflow: hidden;
+  min-height: 0;
 }
 
 .media-card .ant-tabs-content,
@@ -302,7 +303,7 @@ jmnode.important {
 .media-card .ant-tabs-tabpane,
 .feature-card .ant-tabs-tabpane {
   height: 100%;
-  overflow: hidden;
+  overflow: auto;
   padding: 16px;
 }
 
@@ -415,6 +416,40 @@ jmnode.important {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-height: 0;
+  overflow: auto;
+}
+
+.result-selector {
+  border: 1px solid #f0f0f0;
+  border-radius: 8px;
+  background: #fff;
+  padding: 8px 12px;
+}
+
+.result-selector-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.result-selector-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px dashed #d9d9d9;
+  border-radius: 6px;
+}
+
+.result-selector-item.selected {
+  border-style: solid;
+  border-color: #91d5ff;
+  background: #e6f7ff;
+}
+
+.result-selector-actions .ant-btn {
+  padding: 0 8px;
 }
 
 /* 简单总结样式 */

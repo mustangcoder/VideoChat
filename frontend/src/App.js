@@ -1,6 +1,6 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Layout, Upload, Button, Input, Card, message, Table, Tabs, Pagination } from 'antd';
-import { UploadOutlined, SendOutlined, SoundOutlined, SyncOutlined, DownloadOutlined, CopyOutlined, StopOutlined, DeleteOutlined, GithubOutlined } from '@ant-design/icons';
+import React, { useState, useRef, useEffect } from 'react';
+import { Layout, Upload, Button, Input, Card, message, Table, Tabs, Pagination, Checkbox } from 'antd';
+import { UploadOutlined, SendOutlined, SoundOutlined, SyncOutlined, DownloadOutlined, CopyOutlined, StopOutlined, DeleteOutlined, GithubOutlined, ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import Mermaid from 'mermaid';
 import './App.css';
@@ -96,32 +96,85 @@ const MindmapContent = ({ fileId, content, isLoading }) => {
     return <div id={containerId} className="mindmap-container" />;
 };
 
+const ResultFileSelector = ({ files, selectedIds, onToggle, onMove }) => {
+    if (files.length === 0) {
+        return (
+            <div className="empty-state">
+                <p>暂无转录结果文件</p>
+            </div>
+        );
+    }
+
+    return (
+        <div className="result-selector">
+            <div className="result-selector-list">
+                {files.map(file => {
+                    const selectedIndex = selectedIds.indexOf(file.id);
+                    const isSelected = selectedIndex !== -1;
+                    return (
+                        <div key={file.id} className={`result-selector-item ${isSelected ? 'selected' : ''}`}>
+                            <Checkbox
+                                checked={isSelected}
+                                onChange={(e) => onToggle(file.id, e.target.checked)}
+                            >
+                                {file.name}
+                            </Checkbox>
+                            <div className="result-selector-actions">
+                                <Button
+                                    size="small"
+                                    icon={<ArrowUpOutlined />}
+                                    disabled={!isSelected || selectedIndex === 0}
+                                    onClick={() => onMove(file.id, 'up')}
+                                >
+                                    上移
+                                </Button>
+                                <Button
+                                    size="small"
+                                    icon={<ArrowDownOutlined />}
+                                    disabled={!isSelected || selectedIndex === selectedIds.length - 1}
+                                    onClick={() => onMove(file.id, 'down')}
+                                >
+                                    下移
+                                </Button>
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+};
+
 function App() {
     const [summary, setSummary] = useState('');
     // eslint-disable-next-line no-unused-vars
     const [mindmap, setMindmap] = useState('');
-    const [messages, setMessages] = useState([]);
-    const [inputMessage, setInputMessage] = useState('');
+    const [messagesByFile, setMessagesByFile] = useState({});
+    const [inputMessages, setInputMessages] = useState({});
     const [mediaUrl, setMediaUrl] = useState(null);
     const [isTranscribing, setIsTranscribing] = useState(false);
     const [isMindmapLoading, setIsMindmapLoading] = useState(false);
     const mediaRef = useRef(null);
     const [detailedSummary, setDetailedSummary] = useState('');
-    const [isUserScrolling, setIsUserScrolling] = useState(false);
-    const messagesEndRef = useRef(null);
-    const [isGenerating, setIsGenerating] = useState(false);
-    const abortController = useRef(null);
-    const [isComposing, setIsComposing] = useState(false);
+    const [generatingFiles, setGeneratingFiles] = useState(new Set());
+    const abortControllers = useRef({});
     const jmInstanceRef = useRef(null);
     const [uploadedFiles, setUploadedFiles] = useState([]);  // 存储上传的文件列表
     const [selectedFiles, setSelectedFiles] = useState([]);  // 存储选中的文件
     const [currentFile, setCurrentFile] = useState(null);    // 当前预览的文件
+    const [resultSelection, setResultSelection] = useState([]);
     const [pageSize, setPageSize] = useState(5); // 默认每页显示5个文件
     const [currentPage, setCurrentPage] = useState(1); // 添加当前页码状态
     const [abortTranscribing, setAbortTranscribing] = useState(false); // 添加停止转录状态
     const [mindmapLoadingFiles, setMindmapLoadingFiles] = useState(new Set());
     const [summaryLoadingFiles, setSummaryLoadingFiles] = useState(new Set());
     const [detailedSummaryLoadingFiles, setDetailedSummaryLoadingFiles] = useState(new Set());
+    const [mergedSummary, setMergedSummary] = useState('');
+    const [mergedDetailedSummary, setMergedDetailedSummary] = useState('');
+    const [mergedMindmapData, setMergedMindmapData] = useState(null);
+    const [mergedSummaryLoading, setMergedSummaryLoading] = useState(false);
+    const [mergedDetailedSummaryLoading, setMergedDetailedSummaryLoading] = useState(false);
+    const [mergedMindmapLoading, setMergedMindmapLoading] = useState(false);
 
     // 打印 uploadedFiles 的变化
     useEffect(() => {
@@ -154,6 +207,38 @@ function App() {
             }
         });
     }, []);
+
+    const hasTranscription = (file) => file?.transcription && file.transcription.length > 0;
+
+    const areArraysEqual = (left, right) => {
+        if (left.length !== right.length) return false;
+        return left.every((value, index) => value === right[index]);
+    };
+
+    useEffect(() => {
+        const transcribedIds = uploadedFiles.filter(hasTranscription).map(file => file.id);
+        setResultSelection(prev => {
+            const existing = prev.filter(id => transcribedIds.includes(id));
+            if (existing.length > 0) {
+                return areArraysEqual(existing, prev) ? prev : existing;
+            }
+            if (currentFile && transcribedIds.includes(currentFile.id)) {
+                const nextSelection = [currentFile.id];
+                return areArraysEqual(prev, nextSelection) ? prev : nextSelection;
+            }
+            const nextSelection = transcribedIds.length > 0 ? [transcribedIds[0]] : [];
+            return areArraysEqual(prev, nextSelection) ? prev : nextSelection;
+        });
+    }, [uploadedFiles, currentFile]);
+
+    const mergedSelectionKey = resultSelection.join('|');
+    const mergedChatKey = mergedSelectionKey ? `merged:${mergedSelectionKey}` : '';
+
+    useEffect(() => {
+        setMergedSummary('');
+        setMergedDetailedSummary('');
+        setMergedMindmapData(null);
+    }, [mergedSelectionKey]);
 
     const handleUpload = async (file) => {
         // 检查文件类型
@@ -434,8 +519,8 @@ function App() {
     };
 
     // 检查是否有转录结果的函数
-    const checkTranscription = () => {
-        if (!currentFile?.transcription || currentFile.transcription.length === 0) {
+    const checkTranscription = (file) => {
+        if (!hasTranscription(file)) {
             message.warning('需等待视频/音频完成转录');
             return false;
         }
@@ -443,18 +528,17 @@ function App() {
     };
 
     // 修改简单总结函数
-    const handleSummary = async () => {
-        if (!checkTranscription()) return;
-        if (!currentFile) return;
-
-        const fileId = currentFile.id;
+    const handleSummary = async (fileId) => {
+        const file = uploadedFiles.find(f => f.id === fileId);
+        if (!file) return;
+        if (!checkTranscription(file)) return;
 
         if (summaryLoadingFiles.has(fileId)) {
             message.warning('该文件正在生成总结，请稍候');
             return;
         }
 
-        const text = currentFile.transcription.map(item => item.text).join('\n');
+        const text = file.transcription.map(item => item.text).join('\n');
         try {
             setSummaryLoadingFiles(prev => new Set([...prev, fileId]));
 
@@ -492,6 +576,7 @@ function App() {
                 fileRef.summary = summaryText;
                 // 强制更新 uploadedFiles 以触发重渲染
                 setUploadedFiles([...uploadedFiles]);
+                setCurrentFile(fileRef);
             }
 
         } catch (error) {
@@ -507,11 +592,10 @@ function App() {
     };
 
     // 修改生成思维导图的函数
-    const handleMindmap = async () => {
-        if (!checkTranscription()) return;
-        if (!currentFile) return;
-
-        const fileId = currentFile.id; // 保存当前文件ID
+    const handleMindmap = async (fileId) => {
+        const file = uploadedFiles.find(f => f.id === fileId);
+        if (!file) return;
+        if (!checkTranscription(file)) return;
 
         // 检查当前文件是否正在生成思维导图
         if (mindmapLoadingFiles.has(fileId)) {
@@ -519,7 +603,7 @@ function App() {
             return;
         }
 
-        const text = currentFile.transcription.map(item => item.text).join('\n');
+        const text = file.transcription.map(item => item.text).join('\n');
         try {
             // 将当前文件添加到正在生成的集合中
             setMindmapLoadingFiles(prev => new Set([...prev, fileId]));
@@ -628,40 +712,47 @@ function App() {
     }, []);
 
     // 修改发送消息函数
-    const handleSendMessage = async () => {
-        // 如果正在生成，则停止生成
-        if (isGenerating) {
-            abortController.current?.abort();
-            setIsGenerating(false);
-            // 更新最后一条息为"已停止生成"
-            setMessages(prevMessages => {
-                const newMessages = [...prevMessages];
-                if (newMessages.length > 0) {
-                    const lastMessage = newMessages[newMessages.length - 1];
+    const handleSendMessage = async (targetId, contextText) => {
+        const file = contextText ? null : uploadedFiles.find(f => f.id === targetId);
+        if (!contextText && !file) return;
+
+        if (generatingFiles.has(targetId)) {
+            abortControllers.current[targetId]?.abort();
+            setGeneratingFiles(prev => {
+                const next = new Set(prev);
+                next.delete(targetId);
+                return next;
+            });
+            setMessagesByFile(prev => {
+                const fileMessages = [...(prev[targetId] || [])];
+                if (fileMessages.length > 0) {
+                    const lastMessage = fileMessages[fileMessages.length - 1];
                     if (lastMessage.role === 'assistant') {
-                        lastMessage.content += '\n\n*[已停止生成]*';
+                        fileMessages[fileMessages.length - 1] = {
+                            ...lastMessage,
+                            content: `${lastMessage.content}\n\n*[已停止生成]*`
+                        };
                     }
                 }
-                return newMessages;
+                return { ...prev, [targetId]: fileMessages };
             });
             return;
         }
 
-        // 检查转录和输入
-        if (!checkTranscription()) return;
+        if (!contextText && !checkTranscription(file)) return;
+        const inputMessage = inputMessages[targetId] || '';
         if (!inputMessage.trim()) {
             message.warning('请输入消息内容');
             return;
         }
 
         const newMessage = { role: 'user', content: inputMessage };
-        const currentMessages = [...messages, newMessage];
-        setMessages(currentMessages);
-        setInputMessage('');
-        setIsGenerating(true);
+        const currentMessages = [...(messagesByFile[targetId] || []), newMessage];
+        setMessagesByFile(prev => ({ ...prev, [targetId]: currentMessages }));
+        setInputMessages(prev => ({ ...prev, [targetId]: '' }));
+        setGeneratingFiles(prev => new Set([...prev, targetId]));
 
-        // 创建新的 AbortController
-        abortController.current = new AbortController();
+        abortControllers.current[targetId] = new AbortController();
 
         try {
             const response = await fetch('http://localhost:8000/api/chat', {
@@ -669,9 +760,9 @@ function App() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     messages: currentMessages,
-                    context: currentFile?.transcription.map(item => item.text).join('\n'),
+                    context: contextText || file.transcription.map(item => item.text).join('\n'),
                 }),
-                signal: abortController.current.signal
+                signal: abortControllers.current[targetId].signal
             });
 
             if (!response.ok) {
@@ -681,8 +772,10 @@ function App() {
             const reader = response.body.getReader();
             let aiResponse = '';
 
-            // 创建 AI 息占位
-            setMessages([...currentMessages, { role: 'assistant', content: '' }]);
+            setMessagesByFile(prev => ({
+                ...prev,
+                [targetId]: [...currentMessages, { role: 'assistant', content: '' }]
+            }));
 
             while (true) {
                 try {
@@ -692,10 +785,10 @@ function App() {
                     const chunk = new TextDecoder().decode(value);
                     aiResponse += chunk;
 
-                    setMessages([
-                        ...currentMessages,
-                        { role: 'assistant', content: aiResponse }
-                    ]);
+                    setMessagesByFile(prev => ({
+                        ...prev,
+                        [targetId]: [...currentMessages, { role: 'assistant', content: aiResponse }]
+                    }));
                 } catch (error) {
                     if (error.name === 'AbortError') {
                         // 在被中断时立即退出循环
@@ -712,8 +805,12 @@ function App() {
                 message.error('发送消息失败：' + error.message);
             }
         } finally {
-            setIsGenerating(false);
-            abortController.current = null;
+            setGeneratingFiles(prev => {
+                const next = new Set(prev);
+                next.delete(targetId);
+                return next;
+            });
+            delete abortControllers.current[targetId];
         }
     };
 
@@ -762,9 +859,8 @@ function App() {
     ];
 
     // 修改导出函数
-    const handleExport = async (format) => {
-        // 查是否有选中的文件
-        if (selectedFiles.length === 0) {
+    const handleExport = async (format, fileIds = resultSelection) => {
+        if (fileIds.length === 0) {
             message.warning('请选择需要导出的文件');
             return;
         }
@@ -774,11 +870,11 @@ function App() {
             message.loading('正在导出选中的文件...', 0);
 
             // 遍历选中的文件
-            for (const fileId of selectedFiles) {
+            for (const fileId of fileIds) {
                 const file = uploadedFiles.find(f => f.id === fileId);
 
                 // 检查文件是否有转录结果
-                if (!file || !file.transcription || file.transcription.length === 0) {
+                if (!file || !hasTranscription(file)) {
                     message.warning(`文件 "${file?.name}" 没有转录结果，已跳过`);
                     continue;
                 }
@@ -831,18 +927,17 @@ function App() {
     };
 
     // 修改详细总结函数
-    const handleDetailedSummary = async () => {
-        if (!checkTranscription()) return;
-        if (!currentFile) return;
-
-        const fileId = currentFile.id;
+    const handleDetailedSummary = async (fileId) => {
+        const file = uploadedFiles.find(f => f.id === fileId);
+        if (!file) return;
+        if (!checkTranscription(file)) return;
 
         if (detailedSummaryLoadingFiles.has(fileId)) {
             message.warning('该文件正在生成详细总结，请稍候');
             return;
         }
 
-        const text = currentFile.transcription.map(item => item.text).join('\n');
+        const text = file.transcription.map(item => item.text).join('\n');
         try {
             setDetailedSummaryLoadingFiles(prev => new Set([...prev, fileId]));
 
@@ -891,6 +986,128 @@ function App() {
                 newSet.delete(fileId);
                 return newSet;
             });
+        }
+    };
+
+    const handleMergedSummary = async () => {
+        if (mergedTranscribedFiles.length === 0) {
+            message.warning('请选择需要合并的转录结果文件');
+            return;
+        }
+        if (mergedSummaryLoading) {
+            message.warning('合并总结正在生成，请稍候');
+            return;
+        }
+
+        try {
+            setMergedSummaryLoading(true);
+            setMergedSummary('');
+
+            const response = await fetch('http://localhost:8000/api/summary', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: mergedText }),
+            });
+
+            if (!response.ok) {
+                throw new Error('生成合并总结失败');
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let summaryText = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value, { stream: true });
+                summaryText += chunk;
+                setMergedSummary(summaryText);
+            }
+        } catch (error) {
+            console.error('Merged summary generation failed:', error);
+            message.error('生成合并总结失败：' + error.message);
+        } finally {
+            setMergedSummaryLoading(false);
+        }
+    };
+
+    const handleMergedDetailedSummary = async () => {
+        if (mergedTranscribedFiles.length === 0) {
+            message.warning('请选择需要合并的转录结果文件');
+            return;
+        }
+        if (mergedDetailedSummaryLoading) {
+            message.warning('合并详细总结正在生成，请稍候');
+            return;
+        }
+
+        try {
+            setMergedDetailedSummaryLoading(true);
+            setMergedDetailedSummary('');
+
+            const response = await fetch('http://localhost:8000/api/detailed-summary', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: mergedText }),
+            });
+
+            if (!response.ok) {
+                throw new Error('生成合并详细总结失败');
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let summaryText = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value, { stream: true });
+                summaryText += chunk;
+                setMergedDetailedSummary(summaryText);
+            }
+        } catch (error) {
+            console.error('Merged detailed summary generation failed:', error);
+            message.error('生成合并详细总结失败：' + error.message);
+        } finally {
+            setMergedDetailedSummaryLoading(false);
+        }
+    };
+
+    const handleMergedMindmap = async () => {
+        if (mergedTranscribedFiles.length === 0) {
+            message.warning('请选择需要合并的转录结果文件');
+            return;
+        }
+        if (mergedMindmapLoading) {
+            message.warning('合并思维导图正在生成，请稍候');
+            return;
+        }
+
+        try {
+            setMergedMindmapLoading(true);
+            setMergedMindmapData(null);
+
+            const response = await fetch('http://localhost:8000/api/mindmap', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: mergedText }),
+            });
+
+            if (!response.ok) {
+                throw new Error('生成合并思维导图失败');
+            }
+
+            const data = await response.json();
+            setMergedMindmapData(data.mindmap);
+        } catch (error) {
+            console.error('Merged mindmap generation failed:', error);
+            message.error('生成合并思维导图失败：' + error.message);
+        } finally {
+            setMergedMindmapLoading(false);
         }
     };
 
@@ -943,25 +1160,6 @@ function App() {
             });
     };
 
-    // 添加滚动处理函数
-    const handleScroll = (e) => {
-        const element = e.target;
-        const isScrolledToBottom = Math.abs(element.scrollHeight - element.scrollTop - element.clientHeight) < 10;
-        setIsUserScrolling(!isScrolledToBottom);
-    };
-
-    // 添加滚动到底部的函数
-    const scrollToBottom = useCallback(() => {
-        if (messagesEndRef.current && !isUserScrolling) {
-            messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
-        }
-    }, [isUserScrolling]);
-
-    // 监听消息变化，自动滚动
-    useEffect(() => {
-        scrollToBottom();
-    }, [messages, scrollToBottom]);
-
     // 添加全部删除的处理函数
     const handleDeleteAll = () => {
         if (selectedFiles.length === 0) {
@@ -989,11 +1187,43 @@ function App() {
         message.success('已删除选中的文件');
     };
 
-    // 添加一个函数来计算选中的已转录文件数量
-    const getSelectedTranscribedFilesCount = () => {
-        return uploadedFiles.filter(file =>
-            selectedFiles.includes(file.id) && file.status === 'done'
-        ).length;
+    const transcribedFiles = uploadedFiles.filter(hasTranscription);
+    const mergedTranscribedFiles = resultSelection
+        .map(id => uploadedFiles.find(file => file.id === id))
+        .filter(file => file && hasTranscription(file));
+
+    const buildMergedText = (files) => {
+        if (files.length === 0) return '';
+        return files.map(file => {
+            const text = file.transcription.map(item => item.text).join('\n');
+            return `# 文件：${file.name}\n${text}`;
+        }).join('\n\n');
+    };
+
+    const mergedText = buildMergedText(mergedTranscribedFiles);
+    const mergedIdSuffix = mergedSelectionKey ? mergedSelectionKey.split('|').join('-') : 'empty';
+
+    const handleToggleResultSelection = (id, checked) => {
+        setResultSelection(prev => {
+            const next = [...prev];
+            const idx = next.indexOf(id);
+            if (checked && idx === -1) next.push(id);
+            if (!checked && idx !== -1) next.splice(idx, 1);
+            return next;
+        });
+    };
+
+    const handleMoveResultSelection = (id, direction) => {
+        setResultSelection(prev => {
+            const next = [...prev];
+            const idx = next.indexOf(id);
+            if (idx === -1) return next;
+            const target = direction === 'up' ? idx - 1 : idx + 1;
+            if (target < 0 || target >= next.length) return next;
+            const [item] = next.splice(idx, 1);
+            next.splice(target, 0, item);
+            return next;
+        });
     };
 
     // 修改标签页内容
@@ -1005,8 +1235,8 @@ function App() {
                 <div className="tab-content">
                     <div className="export-section">
                         <div className="selection-tip">
-                            {selectedFiles.length > 0 && (
-                                <span>已选择 {getSelectedTranscribedFilesCount()} 个转录文件</span>
+                            {resultSelection.length > 0 && (
+                                <span>已选择 {resultSelection.length} 个转录文件</span>
                             )}
                         </div>
                         <div className="export-buttons">
@@ -1014,55 +1244,58 @@ function App() {
                                 <Button
                                     onClick={() => handleExport('vtt')}
                                     icon={<DownloadOutlined />}
-                                    disabled={!currentFile?.transcription}
+                                    disabled={resultSelection.length === 0}
                                 >
                                     VTT
                                 </Button>
                                 <Button
                                     onClick={() => handleExport('srt')}
                                     icon={<DownloadOutlined />}
-                                    disabled={!currentFile?.transcription}
+                                    disabled={resultSelection.length === 0}
                                 >
                                     SRT
                                 </Button>
                                 <Button
                                     onClick={() => handleExport('txt')}
                                     icon={<DownloadOutlined />}
-                                    disabled={!currentFile?.transcription}
+                                    disabled={resultSelection.length === 0}
                                 >
                                     TXT
                                 </Button>
                             </Button.Group>
                         </div>
                     </div>
-                    {!currentFile ? (
+                    <ResultFileSelector
+                        files={transcribedFiles}
+                        selectedIds={resultSelection}
+                        onToggle={handleToggleResultSelection}
+                        onMove={handleMoveResultSelection}
+                    />
+                    {resultSelection.length === 0 ? (
                         <div className="empty-state">
-                            <p>请在左侧选择要查看转录结果的文件</p>
+                            <p>请选择要展示的转录结果文件</p>
                         </div>
                     ) : (
-                        <>
-                            {currentFile && (
-                                <div className="current-file-tip">
-                                    <span>当前文件：{currentFile.name}</span>
-                                </div>
-                            )}
-                            {!currentFile.transcription ? (
-                                <div className="empty-state">
-                                    <p>当前文件尚未完成转录</p>
-                                </div>
-                            ) : (
-                                <Table
-                                    dataSource={currentFile.transcription.map((item, index) => ({
-                                        ...item,
-                                        key: index,
-                                    }))}
-                                    columns={transcriptionColumns}
-                                    pagination={false}
-                                    size="small"
-                                    className="transcription-table full-height"
-                                />
-                            )}
-                        </>
+                        resultSelection.map(fid => {
+                            const file = uploadedFiles.find(f => f.id === fid);
+                            if (!file || !hasTranscription(file)) return null;
+                            return (
+                                <Card key={fid} style={{ marginTop: 8 }}>
+                                    <div className="current-file-tip">
+                                        <span>文件：{file.name}</span>
+                                    </div>
+                                    <Table
+                                        dataSource={file.transcription.map((item, index) => ({
+                                            ...item,
+                                            key: index,
+                                        }))}
+                                        columns={transcriptionColumns}
+                                        pagination={false}
+                                        size="small"
+                                    />
+                                </Card>
+                            );
+                        })
                     )}
                 </div>
             ),
@@ -1072,45 +1305,90 @@ function App() {
             label: '简单总结',
             children: (
                 <div className="tab-content">
-                    {currentFile && (
-                        <div className="current-file-tip">
-                            <span>当前文件：{currentFile.name}</span>
-                        </div>
-                    )}
-                    <div className="button-group">
-                        <Button
-                            onClick={handleSummary}
-                            loading={summaryLoadingFiles.has(currentFile?.id)}
-                            disabled={!currentFile?.transcription || summaryLoadingFiles.has(currentFile?.id)}
-                        >
-                            {summaryLoadingFiles.has(currentFile?.id) ? '生成中...' : '生成总结'}
-                        </Button>
-                        <Button
-                            onClick={() => handleExportSummary(currentFile?.summary)}
-                            icon={<DownloadOutlined />}
-                            disabled={!currentFile?.summary}
-                        >
-                            导出总结
-                        </Button>
-                    </div>
-                    {!currentFile ? (
+                    <ResultFileSelector
+                        files={transcribedFiles}
+                        selectedIds={resultSelection}
+                        onToggle={handleToggleResultSelection}
+                        onMove={handleMoveResultSelection}
+                    />
+                    {resultSelection.length === 0 ? (
                         <div className="empty-state">
-                            <p>请在左侧选择要查看总结的文件</p>
-                        </div>
-                    ) : !currentFile.transcription ? (
-                        <div className="empty-state">
-                            <p>当前文件尚未完成转录</p>
-                        </div>
-                    ) : !currentFile.summary ? (
-                        <div className="empty-state">
-                            <p>点击上方按钮生成简单总结</p>
+                            <p>请选择要展示的转录结果文件</p>
                         </div>
                     ) : (
-                        <SummaryContent
-                            fileId={currentFile.id}
-                            content={currentFile.summary}
-                            isLoading={summaryLoadingFiles.has(currentFile.id)}
-                        />
+                        <>
+                            <Card style={{ marginTop: 8 }}>
+                                <div className="current-file-tip">
+                                    <span>合并结果（{mergedTranscribedFiles.length} 个文件）</span>
+                                </div>
+                                <div className="button-group">
+                                    <Button
+                                        onClick={handleMergedSummary}
+                                        loading={mergedSummaryLoading}
+                                        disabled={mergedTranscribedFiles.length === 0 || mergedSummaryLoading}
+                                    >
+                                        {mergedSummaryLoading ? '生成中...' : '合并生成总结'}
+                                    </Button>
+                                    <Button
+                                        onClick={() => handleExportSummary(mergedSummary, 'merged_summary')}
+                                        icon={<DownloadOutlined />}
+                                        disabled={!mergedSummary}
+                                    >
+                                        导出合并总结
+                                    </Button>
+                                </div>
+                                {!mergedSummary && !mergedSummaryLoading ? (
+                                    <div className="empty-state">
+                                        <p>点击上方按钮生成合并总结</p>
+                                    </div>
+                                ) : (
+                                    <SummaryContent
+                                        fileId={`merged-summary-${mergedIdSuffix}`}
+                                        content={mergedSummary}
+                                        isLoading={mergedSummaryLoading}
+                                    />
+                                )}
+                            </Card>
+                            {resultSelection.map(fid => {
+                                const file = uploadedFiles.find(f => f.id === fid);
+                                if (!file || !hasTranscription(file)) return null;
+                                const loading = summaryLoadingFiles.has(fid);
+                                return (
+                                    <Card key={fid} style={{ marginTop: 8 }}>
+                                        <div className="current-file-tip">
+                                            <span>文件：{file.name}</span>
+                                        </div>
+                                        <div className="button-group">
+                                            <Button
+                                                onClick={() => handleSummary(fid)}
+                                                loading={loading}
+                                                disabled={!hasTranscription(file) || loading}
+                                            >
+                                                {loading ? '生成中...' : '生成总结'}
+                                            </Button>
+                                            <Button
+                                                onClick={() => handleExportSummary(file.summary)}
+                                                icon={<DownloadOutlined />}
+                                                disabled={!file.summary}
+                                            >
+                                                导出总结
+                                            </Button>
+                                        </div>
+                                        {!file.summary && !loading ? (
+                                            <div className="empty-state">
+                                                <p>点击上方按钮生成简单总结</p>
+                                            </div>
+                                        ) : (
+                                            <SummaryContent
+                                                fileId={fid}
+                                                content={file.summary}
+                                                isLoading={loading}
+                                            />
+                                        )}
+                                    </Card>
+                                );
+                            })}
+                        </>
                     )}
                 </div>
             ),
@@ -1120,45 +1398,90 @@ function App() {
             label: '详细总结',
             children: (
                 <div className="tab-content">
-                    {currentFile && (
-                        <div className="current-file-tip">
-                            <span>当前文件：{currentFile.name}</span>
-                        </div>
-                    )}
-                    <div className="button-group">
-                        <Button
-                            onClick={handleDetailedSummary}
-                            loading={detailedSummaryLoadingFiles.has(currentFile?.id)}
-                            disabled={!currentFile?.transcription || detailedSummaryLoadingFiles.has(currentFile?.id)}
-                        >
-                            {detailedSummaryLoadingFiles.has(currentFile?.id) ? '生成中...' : '生成详细总结'}
-                        </Button>
-                        <Button
-                            onClick={() => handleExportSummary(currentFile?.detailedSummary, 'detailed_summary')}
-                            icon={<DownloadOutlined />}
-                            disabled={!currentFile?.detailedSummary}
-                        >
-                            导出总结
-                        </Button>
-                    </div>
-                    {!currentFile ? (
+                    <ResultFileSelector
+                        files={transcribedFiles}
+                        selectedIds={resultSelection}
+                        onToggle={handleToggleResultSelection}
+                        onMove={handleMoveResultSelection}
+                    />
+                    {resultSelection.length === 0 ? (
                         <div className="empty-state">
-                            <p>请在左侧选择要查看详细总结的文件</p>
-                        </div>
-                    ) : !currentFile.transcription ? (
-                        <div className="empty-state">
-                            <p>当前文件尚未完成转录</p>
-                        </div>
-                    ) : !currentFile.detailedSummary && !detailedSummaryLoadingFiles.has(currentFile.id) ? (
-                        <div className="empty-state">
-                            <p>点击上方按钮生成详细总结</p>
+                            <p>请选择要展示的转录结果文件</p>
                         </div>
                     ) : (
-                        <DetailedSummaryContent
-                            fileId={currentFile.id}
-                            content={currentFile.detailedSummary}
-                            isLoading={detailedSummaryLoadingFiles.has(currentFile.id)}
-                        />
+                        <>
+                            <Card style={{ marginTop: 8 }}>
+                                <div className="current-file-tip">
+                                    <span>合并结果（{mergedTranscribedFiles.length} 个文件）</span>
+                                </div>
+                                <div className="button-group">
+                                    <Button
+                                        onClick={handleMergedDetailedSummary}
+                                        loading={mergedDetailedSummaryLoading}
+                                        disabled={mergedTranscribedFiles.length === 0 || mergedDetailedSummaryLoading}
+                                    >
+                                        {mergedDetailedSummaryLoading ? '生成中...' : '合并生成详细总结'}
+                                    </Button>
+                                    <Button
+                                        onClick={() => handleExportSummary(mergedDetailedSummary, 'merged_detailed_summary')}
+                                        icon={<DownloadOutlined />}
+                                        disabled={!mergedDetailedSummary}
+                                    >
+                                        导出合并总结
+                                    </Button>
+                                </div>
+                                {!mergedDetailedSummary && !mergedDetailedSummaryLoading ? (
+                                    <div className="empty-state">
+                                        <p>点击上方按钮生成合并详细总结</p>
+                                    </div>
+                                ) : (
+                                    <DetailedSummaryContent
+                                        fileId={`merged-detailed-summary-${mergedIdSuffix}`}
+                                        content={mergedDetailedSummary}
+                                        isLoading={mergedDetailedSummaryLoading}
+                                    />
+                                )}
+                            </Card>
+                            {resultSelection.map(fid => {
+                                const file = uploadedFiles.find(f => f.id === fid);
+                                if (!file || !hasTranscription(file)) return null;
+                                const loading = detailedSummaryLoadingFiles.has(fid);
+                                return (
+                                    <Card key={fid} style={{ marginTop: 8 }}>
+                                        <div className="current-file-tip">
+                                            <span>文件：{file.name}</span>
+                                        </div>
+                                        <div className="button-group">
+                                            <Button
+                                                onClick={() => handleDetailedSummary(fid)}
+                                                loading={loading}
+                                                disabled={!hasTranscription(file) || loading}
+                                            >
+                                                {loading ? '生成中...' : '生成详细总结'}
+                                            </Button>
+                                            <Button
+                                                onClick={() => handleExportSummary(file?.detailedSummary, 'detailed_summary')}
+                                                icon={<DownloadOutlined />}
+                                                disabled={!file?.detailedSummary}
+                                            >
+                                                导出总结
+                                            </Button>
+                                        </div>
+                                        {!file.detailedSummary && !loading ? (
+                                            <div className="empty-state">
+                                                <p>点击上方按钮生成详细总结</p>
+                                            </div>
+                                        ) : (
+                                            <DetailedSummaryContent
+                                                fileId={fid}
+                                                content={file.detailedSummary}
+                                                isLoading={loading}
+                                            />
+                                        )}
+                                    </Card>
+                                );
+                            })}
+                        </>
                     )}
                 </div>
             ),
@@ -1168,36 +1491,76 @@ function App() {
             label: '思维导图',
             children: (
                 <div className="tab-content">
-                    {currentFile && (
-                        <div className="current-file-tip">
-                            <span>当前文件：{currentFile.name}</span>
-                        </div>
-                    )}
-                    <Button
-                        onClick={handleMindmap}
-                        loading={mindmapLoadingFiles.has(currentFile?.id)}
-                        disabled={!currentFile?.transcription || mindmapLoadingFiles.has(currentFile?.id)}
-                    >
-                        {mindmapLoadingFiles.has(currentFile?.id) ? '生成中...' : '生成思维导图'}
-                    </Button>
-                    {!currentFile ? (
+                    <ResultFileSelector
+                        files={transcribedFiles}
+                        selectedIds={resultSelection}
+                        onToggle={handleToggleResultSelection}
+                        onMove={handleMoveResultSelection}
+                    />
+                    {resultSelection.length === 0 ? (
                         <div className="empty-state">
-                            <p>请在左侧选择要查看思维导图的文件</p>
-                        </div>
-                    ) : !currentFile.transcription ? (
-                        <div className="empty-state">
-                            <p>当前文件尚未完成转录</p>
-                        </div>
-                    ) : !currentFile.mindmapData && !mindmapLoadingFiles.has(currentFile.id) ? (
-                        <div className="empty-state">
-                            <p>点击上方按钮生成思维导图</p>
+                            <p>请选择要展示的转录结果文件</p>
                         </div>
                     ) : (
-                        <MindmapContent
-                            fileId={currentFile.id}
-                            content={currentFile.mindmapData}
-                            isLoading={mindmapLoadingFiles.has(currentFile.id)}
-                        />
+                        <>
+                            <Card style={{ marginTop: 8 }}>
+                                <div className="current-file-tip">
+                                    <span>合并结果（{mergedTranscribedFiles.length} 个文件）</span>
+                                </div>
+                                <div className="button-group">
+                                    <Button
+                                        onClick={handleMergedMindmap}
+                                        loading={mergedMindmapLoading}
+                                        disabled={mergedTranscribedFiles.length === 0 || mergedMindmapLoading}
+                                    >
+                                        {mergedMindmapLoading ? '生成中...' : '合并生成思维导图'}
+                                    </Button>
+                                </div>
+                                {!mergedMindmapData && !mergedMindmapLoading ? (
+                                    <div className="empty-state">
+                                        <p>点击上方按钮生成合并思维导图</p>
+                                    </div>
+                                ) : (
+                                    <MindmapContent
+                                        fileId={`merged-mindmap-${mergedIdSuffix}`}
+                                        content={mergedMindmapData}
+                                        isLoading={mergedMindmapLoading}
+                                    />
+                                )}
+                            </Card>
+                            {resultSelection.map(fid => {
+                                const file = uploadedFiles.find(f => f.id === fid);
+                                if (!file || !hasTranscription(file)) return null;
+                                const loading = mindmapLoadingFiles.has(fid);
+                                return (
+                                    <Card key={fid} style={{ marginTop: 8 }}>
+                                        <div className="current-file-tip">
+                                            <span>文件：{file.name}</span>
+                                        </div>
+                                        <div className="button-group">
+                                            <Button
+                                                onClick={() => handleMindmap(fid)}
+                                                loading={loading}
+                                                disabled={!hasTranscription(file) || loading}
+                                            >
+                                                {loading ? '生成中...' : '生成思维导图'}
+                                            </Button>
+                                        </div>
+                                        {!file.mindmapData && !loading ? (
+                                            <div className="empty-state">
+                                                <p>点击上方按钮生成思维导图</p>
+                                            </div>
+                                        ) : (
+                                            <MindmapContent
+                                                fileId={fid}
+                                                content={file.mindmapData}
+                                                isLoading={loading}
+                                            />
+                                        )}
+                                    </Card>
+                                );
+                            })}
+                        </>
                     )}
                 </div>
             ),
@@ -1207,75 +1570,136 @@ function App() {
             label: '对话交互',
             children: (
                 <div className="tab-content chat-tab">
-                    {!currentFile ? (
+                    <ResultFileSelector
+                        files={transcribedFiles}
+                        selectedIds={resultSelection}
+                        onToggle={handleToggleResultSelection}
+                        onMove={handleMoveResultSelection}
+                    />
+                    {resultSelection.length === 0 ? (
                         <div className="empty-state">
-                            <p>请在左侧选择要查看对话交互的文件</p>
-                        </div>
-                    ) : !currentFile.transcription ? (
-                        <div className="empty-state">
-                            <p>当前文件尚未完成转录</p>
+                            <p>请选择要展示的转录结果文件</p>
                         </div>
                     ) : (
                         <>
-                            <div className="current-file-tip">
-                                <span>当前文件：{currentFile.name}</span>
-                            </div>
-                            <div
-                                className="chat-messages"
-                                onScroll={handleScroll}
-                            >
-                                {messages.map((msg, index) => (
-                                    <div
-                                        key={index}
-                                        className={`message-wrapper ${msg.role === 'user' ? 'user' : 'assistant'}`}
-                                    >
-                                        <div className="message-bubble">
-                                            <div className="message-content">
-                                                <ReactMarkdown>{msg.content}</ReactMarkdown>
+                            <Card style={{ marginTop: 8 }}>
+                                <div className="current-file-tip">
+                                    <span>合并结果（{mergedTranscribedFiles.length} 个文件）</span>
+                                </div>
+                                <div className="chat-messages">
+                                    {(messagesByFile[mergedChatKey] || []).map((msg, index) => (
+                                        <div
+                                            key={index}
+                                            className={`message-wrapper ${msg.role === 'user' ? 'user' : 'assistant'}`}
+                                        >
+                                            <div className="message-bubble">
+                                                <div className="message-content">
+                                                    <ReactMarkdown>{msg.content}</ReactMarkdown>
+                                                </div>
+                                                <Button
+                                                    type="text"
+                                                    className="copy-button"
+                                                    icon={<CopyOutlined />}
+                                                    onClick={() => handleCopyMessage(msg.content)}
+                                                >
+                                                    复制
+                                                </Button>
                                             </div>
+                                            <div className="message-time">
+                                                {new Date().toLocaleTimeString()}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                                <div className="chat-input-area">
+                                    <TextArea
+                                        value={inputMessages[mergedChatKey] || ''}
+                                        onChange={e => setInputMessages(prev => ({ ...prev, [mergedChatKey]: e.target.value }))}
+                                        onKeyDown={e => {
+                                            if (e.key === 'Enter' && !e.shiftKey) {
+                                                e.preventDefault();
+                                                if (mergedTranscribedFiles.length > 0) {
+                                                    handleSendMessage(mergedChatKey, mergedText);
+                                                }
+                                            }
+                                        }}
+                                        placeholder="输入消息按Enter发送，Shift+Enter换行"
+                                        autoSize={{ minRows: 1, maxRows: 4 }}
+                                        disabled={mergedTranscribedFiles.length === 0 || generatingFiles.has(mergedChatKey)}
+                                    />
+                                    <Button
+                                        type="primary"
+                                        icon={generatingFiles.has(mergedChatKey) ? <StopOutlined /> : <SendOutlined />}
+                                        onClick={() => handleSendMessage(mergedChatKey, mergedText)}
+                                        danger={generatingFiles.has(mergedChatKey)}
+                                        disabled={mergedTranscribedFiles.length === 0}
+                                    >
+                                        {generatingFiles.has(mergedChatKey) ? '停止' : '发送'}
+                                    </Button>
+                                </div>
+                            </Card>
+                            {resultSelection.map(fid => {
+                                const file = uploadedFiles.find(f => f.id === fid);
+                                if (!file || !hasTranscription(file)) return null;
+                                const messages = messagesByFile[fid] || [];
+                                const inputVal = inputMessages[fid] || '';
+                                const generating = generatingFiles.has(fid);
+                                return (
+                                    <Card key={fid} style={{ marginTop: 8 }}>
+                                        <div className="current-file-tip">
+                                            <span>文件：{file.name}</span>
+                                        </div>
+                                        <div className="chat-messages">
+                                            {messages.map((msg, index) => (
+                                                <div
+                                                    key={index}
+                                                    className={`message-wrapper ${msg.role === 'user' ? 'user' : 'assistant'}`}
+                                                >
+                                                    <div className="message-bubble">
+                                                        <div className="message-content">
+                                                            <ReactMarkdown>{msg.content}</ReactMarkdown>
+                                                        </div>
+                                                        <Button
+                                                            type="text"
+                                                            className="copy-button"
+                                                            icon={<CopyOutlined />}
+                                                            onClick={() => handleCopyMessage(msg.content)}
+                                                        >
+                                                            复制
+                                                        </Button>
+                                                    </div>
+                                                    <div className="message-time">
+                                                        {new Date().toLocaleTimeString()}
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                        <div className="chat-input-area">
+                                            <TextArea
+                                                value={inputVal}
+                                                onChange={e => setInputMessages(prev => ({ ...prev, [fid]: e.target.value }))}
+                                                onKeyDown={e => {
+                                                    if (e.key === 'Enter' && !e.shiftKey) {
+                                                        e.preventDefault();
+                                                        handleSendMessage(fid);
+                                                    }
+                                                }}
+                                                placeholder="输入消息按Enter发送，Shift+Enter换行"
+                                                autoSize={{ minRows: 1, maxRows: 4 }}
+                                                disabled={generating}
+                                            />
                                             <Button
-                                                type="text"
-                                                className="copy-button"
-                                                icon={<CopyOutlined />}
-                                                onClick={() => handleCopyMessage(msg.content)}
+                                                type="primary"
+                                                icon={generating ? <StopOutlined /> : <SendOutlined />}
+                                                onClick={() => handleSendMessage(fid)}
+                                                danger={generating}
                                             >
-                                                复制
+                                                {generating ? '停止' : '发送'}
                                             </Button>
                                         </div>
-                                        <div className="message-time">
-                                            {new Date().toLocaleTimeString()}
-                                        </div>
-                                    </div>
-                                ))}
-                                <div ref={messagesEndRef} />
-                            </div>
-                            <div className="chat-input-area">
-                                <TextArea
-                                    value={inputMessage}
-                                    onChange={e => setInputMessage(e.target.value)}
-                                    onCompositionStart={() => setIsComposing(true)}
-                                    onCompositionEnd={() => setIsComposing(false)}
-                                    onKeyDown={e => {
-                                        if (e.key === 'Enter' && !e.shiftKey) {
-                                            if (!isComposing) {
-                                                e.preventDefault();
-                                                handleSendMessage();
-                                            }
-                                        }
-                                    }}
-                                    placeholder="输入消息按Enter发送，Shift+Enter换行"
-                                    autoSize={{ minRows: 1, maxRows: 4 }}
-                                    disabled={isGenerating}
-                                />
-                                <Button
-                                    type="primary"
-                                    icon={isGenerating ? <StopOutlined /> : <SendOutlined />}
-                                    onClick={handleSendMessage}
-                                    danger={isGenerating}
-                                >
-                                    {isGenerating ? '停止' : '发送'}
-                                </Button>
-                            </div>
+                                    </Card>
+                                );
+                            })}
                         </>
                     )}
                 </div>
