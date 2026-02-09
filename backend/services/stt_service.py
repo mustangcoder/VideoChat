@@ -28,7 +28,10 @@ async def transcribe_audio(file_path: str) -> list:
     try:
         stt_model = await get_model()
         segments_generator = stt_model.transcribe(file_path, beam_size=STT_CONFIG["beam_size"],
-                                              language=STT_CONFIG["language"], vad_filter=STT_CONFIG["vad_filter"])
+                                                  temperature=STT_CONFIG["temperature"],
+                                                  language=STT_CONFIG["language"],
+                                                  vad_filter=STT_CONFIG["vad_filter"],
+                                                  condition_on_previous_text=STT_CONFIG["condition_on_previous_text"])
 
         transcription = []
         segments, info = segments_generator

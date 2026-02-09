@@ -26,6 +26,7 @@ def init_db():
                 detailed_summary TEXT,
                 mindmap_data TEXT,
                 file_size INTEGER,
+                file_hash TEXT,
                 duration REAL,
                 transcribe_elapsed REAL,
                 created_at TEXT NOT NULL,
@@ -34,6 +35,7 @@ def init_db():
             """
         )
         ensure_file_size_column(conn)
+        ensure_file_hash_column(conn)
         ensure_detailed_summary_column(conn)
         ensure_transcribe_elapsed_column(conn)
         backfill_file_sizes(conn)
@@ -93,6 +95,11 @@ def ensure_file_size_column(conn):
     if "file_size" not in columns:
         conn.execute("ALTER TABLE files ADD COLUMN file_size INTEGER")
 
+def ensure_file_hash_column(conn):
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()]
+    if "file_hash" not in columns:
+        conn.execute("ALTER TABLE files ADD COLUMN file_hash TEXT")
+
 
 def ensure_detailed_summary_column(conn):
     columns = [row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()]
@@ -131,6 +138,7 @@ def row_to_file(row):
         "detailedSummary": row["detailed_summary"] or "",
         "mindmapData": row["mindmap_data"],
         "fileSize": row["file_size"] or 0,
+        "fileHash": row["file_hash"],
         "duration": row["duration"] or 0,
         "transcribeElapsed": row["transcribe_elapsed"],
         "createdAt": row["created_at"],
@@ -156,13 +164,20 @@ def get_file(file_id: str):
         conn.close()
 
 
-def find_duplicate_file(name: str, file_size: int):
+def find_duplicate_file(name: str, file_size: int, file_hash: str = None):
     conn = get_connection()
     try:
-        row = conn.execute(
-            "SELECT * FROM files WHERE name = ? AND file_size = ? LIMIT 1",
-            (name, file_size),
-        ).fetchone()
+        row = None
+        if file_hash:
+            row = conn.execute(
+                "SELECT * FROM files WHERE file_hash = ? LIMIT 1",
+                (file_hash,),
+            ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT * FROM files WHERE name = ? AND file_size = ? LIMIT 1",
+                (name, file_size),
+            ).fetchone()
         return row_to_file(row)
     finally:
         conn.close()
@@ -177,8 +192,8 @@ def insert_file(file_data: dict):
             INSERT INTO files (
                 id, name, type, stored_name, url, status,
                 transcription, summary, detailed_summary, mindmap_data,
-                file_size, duration, transcribe_elapsed, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                file_size, file_hash, duration, transcribe_elapsed, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 file_data["id"],
@@ -192,6 +207,7 @@ def insert_file(file_data: dict):
                 file_data.get("detailedSummary", ""),
                 file_data.get("mindmapData"),
                 file_data.get("fileSize", 0),
+                file_data.get("fileHash"),
                 file_data.get("duration", 0),
                 file_data.get("transcribeElapsed"),
                 now,
@@ -222,11 +238,65 @@ def update_file(file_id: str, fields: dict):
         conn.close()
 
 
-def delete_file(file_id: str):
+def delete_file_with_related(file_id: str):
     conn = get_connection()
     try:
         row = conn.execute("SELECT stored_name FROM files WHERE id = ?", (file_id,)).fetchone()
         conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        patterns = [
+            file_id,
+            f"{file_id}|%",
+            f"%|{file_id}",
+            f"%|{file_id}|%",
+        ]
+        conn.execute(
+            """
+            DELETE FROM merged_summaries
+            WHERE selection_key = ?
+               OR selection_key LIKE ?
+               OR selection_key LIKE ?
+               OR selection_key LIKE ?
+            """,
+            patterns,
+        )
+        conn.execute(
+            """
+            DELETE FROM merged_detailed_summaries
+            WHERE selection_key = ?
+               OR selection_key LIKE ?
+               OR selection_key LIKE ?
+               OR selection_key LIKE ?
+            """,
+            patterns,
+        )
+        conn.execute(
+            """
+            DELETE FROM merged_mindmaps
+            WHERE selection_key = ?
+               OR selection_key LIKE ?
+               OR selection_key LIKE ?
+               OR selection_key LIKE ?
+            """,
+            patterns,
+        )
+        chat_patterns = [
+            file_id,
+            f"merged:{file_id}",
+            f"merged:{file_id}|%",
+            f"merged:%|{file_id}",
+            f"merged:%|{file_id}|%",
+        ]
+        conn.execute(
+            """
+            DELETE FROM chat_histories
+            WHERE context_key = ?
+               OR context_key = ?
+               OR context_key LIKE ?
+               OR context_key LIKE ?
+               OR context_key LIKE ?
+            """,
+            chat_patterns,
+        )
         conn.commit()
     finally:
         conn.close()

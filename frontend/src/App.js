@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { Layout, Upload, Button, Input, Card, message, Table, Tabs, Pagination, Checkbox } from 'antd';
+import { Layout, Upload, Button, Input, Card, message, Table, Tabs, Pagination, Checkbox, Modal } from 'antd';
 import { UploadOutlined, SendOutlined, SoundOutlined, SyncOutlined, DownloadOutlined, CopyOutlined, StopOutlined, DeleteOutlined, GithubOutlined, ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import Mermaid from 'mermaid';
@@ -713,7 +713,17 @@ function App() {
         }),
     }));
 
-    // 处理文件删除
+    const confirmDeleteWithTip = (onOk, content) => {
+        Modal.confirm({
+            title: '确认删除',
+            content: content || '删除后将同时删除关联的总结、详细总结、思维导图、对话内容。',
+            okText: '删除',
+            okButtonProps: { danger: true },
+            cancelText: '取消',
+            onOk
+        });
+    };
+
     const handleFileDelete = (fileId) => {
         const removeLocal = () => {
             setUploadedFiles(prev => prev.filter(file => file.id !== fileId));
@@ -731,13 +741,19 @@ function App() {
                 }
             }
         };
-
-        fetch(`http://localhost:8000/api/files/${fileId}`, { method: 'DELETE' })
-            .then(() => removeLocal())
-            .catch((error) => {
+        const targetFile = uploadedFiles.find(file => file.id === fileId);
+        const tipContent = targetFile
+            ? `即将删除文件“${targetFile.name}”，删除后将同时删除关联的总结、详细总结、思维导图、对话内容。`
+            : '删除后将同时删除关联的总结、详细总结、思维导图、对话内容。';
+        confirmDeleteWithTip(async () => {
+            try {
+                await fetch(`http://localhost:8000/api/files/${fileId}`, { method: 'DELETE' });
+                removeLocal();
+            } catch (error) {
                 console.error('Failed to delete file:', error);
                 message.error('删除失败：' + error.message);
-            });
+            }
+        }, tipContent);
     };
 
     // 修改文件预览函数
@@ -1653,19 +1669,19 @@ function App() {
             });
     }, []);
 
-    // 添加全部删除的处理函数
     const handleDeleteAll = () => {
         if (selectedFiles.length === 0) {
             message.warning('请选择需要删除的文件');
             return;
         }
-
-        Promise.all(
-            selectedFiles.map(fileId =>
-                fetch(`http://localhost:8000/api/files/${fileId}`, { method: 'DELETE' })
-            )
-        )
-            .then(() => {
+        const tipContent = `即将删除 ${selectedFiles.length} 个文件，删除后将同时删除关联的总结、详细总结、思维导图、对话内容。`;
+        confirmDeleteWithTip(async () => {
+            try {
+                await Promise.all(
+                    selectedFiles.map(fileId =>
+                        fetch(`http://localhost:8000/api/files/${fileId}`, { method: 'DELETE' })
+                    )
+                );
                 setUploadedFiles(prev => prev.filter(file => !selectedFiles.includes(file.id)));
                 setSelectedFiles([]);
 
@@ -1682,11 +1698,11 @@ function App() {
                 }
 
                 message.success('已删除选中的文件');
-            })
-            .catch((error) => {
+            } catch (error) {
                 console.error('Failed to delete files:', error);
                 message.error('删除失败：' + error.message);
-            });
+            }
+        }, tipContent);
     };
 
     const transcribedFiles = useMemo(() => (

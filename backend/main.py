@@ -1,26 +1,84 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 import os
+import ctypes
 import tempfile
 from datetime import datetime
 import time
 import logging
+import hashlib
 from backend.services.stt_service import transcribe_audio, stop_transcription, is_file_being_transcribed, get_transcription_progress
 from backend.services.ai_service import generate_summary, generate_mindmap, chat_with_model, generate_detailed_summary
 from backend.models import ChatMessage, ChatRequest
 import asyncio
 import uuid
 import json
-from backend.db import init_db, list_files, get_file, insert_file, update_file, delete_file, get_merged_summary, upsert_merged_summary, get_merged_detailed_summary, upsert_merged_detailed_summary, find_duplicate_file, get_merged_mindmap, upsert_merged_mindmap, get_chat_history, upsert_chat_history
+from backend.db import init_db, list_files, get_file, insert_file, update_file, delete_file_with_related, get_merged_summary, upsert_merged_summary, get_merged_detailed_summary, upsert_merged_detailed_summary, find_duplicate_file, get_merged_mindmap, upsert_merged_mindmap, get_chat_history, upsert_chat_history
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("videochat")
 
 app = FastAPI()
+
+async def persist_upload_file(file: UploadFile, destination: str, compute_hash: bool = False):
+    file_size = 0
+    hasher = hashlib.sha256() if compute_hash else None
+    try:
+        with open(destination, "wb") as buffer:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                buffer.write(chunk)
+                file_size += len(chunk)
+                if hasher:
+                    hasher.update(chunk)
+    finally:
+        await file.close()
+    return file_size, hasher.hexdigest() if hasher else None
+
+def schedule_delete_on_reboot(file_path: str) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        move_file_ex = ctypes.windll.kernel32.MoveFileExW
+        move_file_ex.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+        move_file_ex.restype = ctypes.c_bool
+        return bool(move_file_ex(file_path, None, 0x00000004))
+    except Exception:
+        return False
+
+def retry_delete_file(file_path: str, attempts: int = 8, delay_seconds: float = 1.0):
+    for _ in range(attempts):
+        if not os.path.exists(file_path):
+            return
+        try:
+            os.remove(file_path)
+            return
+        except (PermissionError, OSError):
+            time.sleep(delay_seconds)
+    if os.path.exists(file_path):
+        schedule_delete_on_reboot(file_path)
+
+async def cancel_transcription_for_file(file_id: str, file_path: str):
+    global transcription_task, current_transcribing_id
+    if not transcription_task:
+        return
+    if current_transcribing_id != file_id and not is_file_being_transcribed(file_path):
+        return
+    stop_transcription()
+    if not transcription_task.cancelled():
+        transcription_task.cancel()
+    try:
+        await asyncio.wait_for(transcription_task, timeout=1.5)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+    transcription_task = None
+    current_transcribing_id = None
 
 # 添加静态文件服务
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
@@ -103,35 +161,26 @@ async def startup_event():
 async def upload_file(file: UploadFile = File(...)):
     global transcription_task
     try:
-        # 保存上传的文件
         file_path = f"uploads/{file.filename}"
         os.makedirs("uploads", exist_ok=True)
+        await persist_upload_file(file, file_path)
         
-        with open(file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # 创建转录任务
         transcription_task = asyncio.create_task(transcribe_audio(file_path))
         try:
             transcription = await transcription_task
             transcription_task = None
-            # 如果转录成功完成，直接返回结果
             return {"transcription": transcription}
             
         except asyncio.CancelledError:
-            # 确保任务被正确取消
             if not transcription_task.cancelled():
                 transcription_task.cancel()
             transcription_task = None
-            # 返回特定的状态码和消息
             return JSONResponse(
                 status_code=499,
                 content={"status": "interrupted", "detail": "Transcription interrupted"}
             )
             
     except asyncio.CancelledError:
-        # 返回特定的状态码和消息
         return JSONResponse(
             status_code=499,
             content={"status": "interrupted", "detail": "Transcription interrupted"}
@@ -210,18 +259,17 @@ async def save_merged_mindmap(request: MergedMindmapRequest):
 async def upload_file_record(file: UploadFile = File(...)):
     try:
         os.makedirs("uploads", exist_ok=True)
-        content = await file.read()
-        file_size = len(content)
-        existing = find_duplicate_file(file.filename, file_size)
-        if existing:
-            return {"skipped": True, "file": existing}
-
         file_id = uuid.uuid4().hex
         stored_name = f"{file_id}_{file.filename}"
         file_path = os.path.join("uploads", stored_name)
-
-        with open(file_path, "wb") as buffer:
-            buffer.write(content)
+        file_size, file_hash = await persist_upload_file(file, file_path, compute_hash=True)
+        existing = find_duplicate_file(file.filename, file_size, file_hash)
+        if existing:
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+            return {"skipped": True, "file": existing}
 
         file_type = "video" if file.content_type and file.content_type.startswith("video/") else "audio"
         record = {
@@ -236,6 +284,7 @@ async def upload_file_record(file: UploadFile = File(...)):
             "detailedSummary": "",
             "mindmapData": None,
             "fileSize": file_size,
+            "fileHash": file_hash,
             "duration": 0,
             "transcribeElapsed": None,
         }
@@ -246,12 +295,37 @@ async def upload_file_record(file: UploadFile = File(...)):
 
 
 @app.delete("/api/files/{file_id}")
-async def remove_file(file_id: str):
-    stored_name = delete_file(file_id)
+async def remove_file(file_id: str, background_tasks: BackgroundTasks):
+    stored_name = delete_file_with_related(file_id)
+    if stored_name is None:
+        raise HTTPException(status_code=404, detail="File not found")
     if stored_name:
         file_path = os.path.join("uploads", stored_name)
         if os.path.exists(file_path):
-            os.remove(file_path)
+            await cancel_transcription_for_file(file_id, file_path)
+            try:
+                os.remove(file_path)
+            except (PermissionError, OSError):
+                deleted = False
+                for _ in range(3):
+                    await asyncio.sleep(0.2)
+                    try:
+                        os.remove(file_path)
+                        deleted = True
+                        break
+                    except (PermissionError, OSError):
+                        pass
+                if not deleted:
+                    pending_path = os.path.join("uploads", f".pending_delete_{file_id}_{uuid.uuid4().hex}")
+                    try:
+                        os.replace(file_path, pending_path)
+                        background_tasks.add_task(retry_delete_file, pending_path, 12, 1.0)
+                        return {"message": "File deleted", "warning": "File is in use and will be removed later"}
+                    except (PermissionError, OSError):
+                        background_tasks.add_task(retry_delete_file, file_path, 12, 1.0)
+                        if schedule_delete_on_reboot(file_path):
+                            return {"message": "File deleted", "warning": "File is scheduled for deletion on reboot"}
+                        return {"message": "File deleted", "warning": "File is in use and will be removed later"}
     return {"message": "File deleted"}
 
 
