@@ -275,10 +275,6 @@ function App() {
                     transcribeElapsed: typeof file.transcribeElapsed === 'number' ? file.transcribeElapsed : null,
                 }));
                 setUploadedFiles(files);
-                if (files.length > 0 && !currentFile) {
-                    setCurrentFile(files[0]);
-                    setMediaUrl({ url: files[0].url, type: files[0].type });
-                }
             } catch (error) {
                 console.error('Failed to load files:', error);
             }
@@ -503,11 +499,6 @@ function App() {
                 setUploadedFiles(prev => prev.map(f => f.id === newFile.id ? { ...f, duration: 0 } : f));
             };
 
-            // 如果是第一个文件，动设置为当前预览文件
-            if (uploadedFiles.length === 0) {
-                setCurrentFile(newFile);
-                setMediaUrl({ url: newFile.url, type: newFile.type });
-            }
         } catch (error) {
             console.error('Upload failed:', error);
             message.error('上传失败：' + error.message);

@@ -277,7 +277,7 @@ async def generate_mindmap(text: str) -> str:
                 {"role": "user", "content": text}
             ],
             "stream": False,
-            "temperature": 0.7,
+            "temperature": 0.5,
             "max_tokens": 2000
         }
 

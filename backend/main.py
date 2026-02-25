@@ -41,6 +41,13 @@ async def persist_upload_file(file: UploadFile, destination: str, compute_hash: 
         await file.close()
     return file_size, hasher.hexdigest() if hasher else None
 
+def sanitize_filename(filename: Optional[str]) -> str:
+    if not filename:
+        return ""
+    base = os.path.basename(filename)
+    base = base.replace("\\", "_").replace("/", "_")
+    return base.strip()
+
 def schedule_delete_on_reboot(file_path: str) -> bool:
     if os.name != "nt":
         return False
@@ -161,8 +168,16 @@ async def startup_event():
 async def upload_file(file: UploadFile = File(...)):
     global transcription_task
     try:
-        file_path = f"uploads/{file.filename}"
         os.makedirs("uploads", exist_ok=True)
+        content_type = file.content_type or ""
+        if not (content_type.startswith("video/") or content_type.startswith("audio/")):
+            raise HTTPException(status_code=400, detail="Unsupported file type")
+        safe_name = sanitize_filename(file.filename)
+        if not safe_name:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        file_id = uuid.uuid4().hex
+        stored_name = f"{file_id}_{safe_name}"
+        file_path = os.path.join("uploads", stored_name)
         await persist_upload_file(file, file_path)
         
         transcription_task = asyncio.create_task(transcribe_audio(file_path))
@@ -259,11 +274,17 @@ async def save_merged_mindmap(request: MergedMindmapRequest):
 async def upload_file_record(file: UploadFile = File(...)):
     try:
         os.makedirs("uploads", exist_ok=True)
+        content_type = file.content_type or ""
+        if not (content_type.startswith("video/") or content_type.startswith("audio/")):
+            raise HTTPException(status_code=400, detail="Unsupported file type")
+        safe_name = sanitize_filename(file.filename)
+        if not safe_name:
+            raise HTTPException(status_code=400, detail="Invalid filename")
         file_id = uuid.uuid4().hex
-        stored_name = f"{file_id}_{file.filename}"
+        stored_name = f"{file_id}_{safe_name}"
         file_path = os.path.join("uploads", stored_name)
         file_size, file_hash = await persist_upload_file(file, file_path, compute_hash=True)
-        existing = find_duplicate_file(file.filename, file_size, file_hash)
+        existing = find_duplicate_file(safe_name, file_size, file_hash)
         if existing:
             try:
                 os.remove(file_path)
@@ -271,10 +292,10 @@ async def upload_file_record(file: UploadFile = File(...)):
                 pass
             return {"skipped": True, "file": existing}
 
-        file_type = "video" if file.content_type and file.content_type.startswith("video/") else "audio"
+        file_type = "video" if content_type.startswith("video/") else "audio"
         record = {
             "id": file_id,
-            "name": file.filename,
+            "name": safe_name,
             "type": file_type,
             "storedName": stored_name,
             "url": f"/uploads/{stored_name}",
