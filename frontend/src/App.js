@@ -258,11 +258,6 @@ function App() {
         action: 180,
     });
 
-    // 打印 uploadedFiles 的变化
-    useEffect(() => {
-        console.log('Uploaded Files:', uploadedFiles);
-    }, [uploadedFiles]);
-
     useEffect(() => {
         abortTranscribingRef.current = abortTranscribing;
     }, [abortTranscribing]);
@@ -356,7 +351,7 @@ function App() {
         }
         const timer = setInterval(() => {
             setNow(Date.now());
-        }, 1000);
+        }, 2000);
         return () => clearInterval(timer);
     }, [transcribingKey]);
 
@@ -370,45 +365,60 @@ function App() {
             if (ids.length === 0) {
                 return;
             }
-            await Promise.all(ids.map(async (fileId) => {
+            const progressList = await Promise.all(ids.map(async (fileId) => {
                 try {
-                    const response = await fetch(`http://localhost:8000/api/files/${fileId}/transcribe-progress`);
+                    const response = await fetch(`http://localhost:8000/api/files/${fileId}`);
                     if (!response.ok) {
-                        return;
+                        return null;
                     }
                     const data = await response.json();
-                    if (stopped) {
-                        return;
-                    }
-                    const progressValue = typeof data.progress === 'number' ? data.progress : null;
-                    const currentValue = typeof data.current === 'number' ? data.current : null;
-                    const durationValue = typeof data.duration === 'number' ? data.duration : null;
-                    const statusValue = typeof data.status === 'string' ? data.status : null;
-                    setUploadedFiles(prev => prev.map(file => file.id === fileId ? {
-                        ...file,
-                        transcribeProgress: progressValue,
-                        transcribeProgressCurrent: currentValue,
-                        transcribeProgressDuration: durationValue,
-                        status: statusValue || file.status,
-                    } : file));
-                    setCurrentFile(prev => prev?.id === fileId ? {
-                        ...prev,
-                        transcribeProgress: progressValue,
-                        transcribeProgressCurrent: currentValue,
-                        transcribeProgressDuration: durationValue,
-                        status: statusValue || prev.status,
-                    } : prev);
+                    return { fileId, data };
                 } catch (error) {
+                    return null;
                 }
             }));
+            if (stopped) {
+                return;
+            }
+            const progressMap = new Map();
+            progressList.forEach(item => {
+                if (!item?.fileId || !item?.data) return;
+                progressMap.set(item.fileId, item.data);
+            });
+            if (progressMap.size === 0) {
+                return;
+            }
+            setUploadedFiles(prev => {
+                let changed = false;
+                const next = prev.map(file => {
+                    const update = progressMap.get(file.id);
+                    if (!update) return file;
+                    if (update.updatedAt && file.updatedAt && update.updatedAt === file.updatedAt) {
+                        return file;
+                    }
+                    const normalized = normalizeFile(update, file);
+                    changed = true;
+                    return normalized;
+                });
+                return changed ? next : prev;
+            });
+            setCurrentFile(prev => {
+                if (!prev) return prev;
+                const update = progressMap.get(prev.id);
+                if (!update) return prev;
+                if (update.updatedAt && prev.updatedAt && update.updatedAt === prev.updatedAt) {
+                    return prev;
+                }
+                return normalizeFile(update, prev);
+            });
         };
         fetchProgress();
-        const timer = setInterval(fetchProgress, 1000);
+        const timer = setInterval(fetchProgress, 3000);
         return () => {
             stopped = true;
             clearInterval(timer);
         };
-    }, [transcribingKey]);
+    }, [transcribingKey, normalizeFile]);
 
     useEffect(() => {
         if (isTranscribing && !hasActiveQueue) {
@@ -422,30 +432,6 @@ function App() {
             setIsTranscribing(true);
         }
     }, [isTranscribing, hasActiveQueue]);
-
-    useEffect(() => {
-        if (!transcribingKey || transcribingIds.length === 0) {
-            return;
-        }
-        let stopped = false;
-        const fetchLiveTranscription = async () => {
-            if (transcribingIds.length === 0) {
-                return;
-            }
-            await Promise.all(transcribingIds.map(async (fileId) => {
-                if (stopped) {
-                    return;
-                }
-                await fetchFileDetails(fileId);
-            }));
-        };
-        fetchLiveTranscription();
-        const timer = setInterval(fetchLiveTranscription, 3000);
-        return () => {
-            stopped = true;
-            clearInterval(timer);
-        };
-    }, [transcribingKey, transcribingIds.length, fetchFileDetails]);
 
     // 初始化 Mermaid
     React.useEffect(() => {
@@ -683,12 +669,11 @@ function App() {
         },
     };
 
-    // 计算当前页应该显示的文件
-    const getPageData = () => {
+    const pageData = useMemo(() => {
         const start = (currentPage - 1) * pageSize;
         const end = start + pageSize;
         return uploadedFiles.slice(start, end);
-    };
+    }, [currentPage, pageSize, uploadedFiles]);
 
     const formatDuration = (seconds) => {
         const safeSeconds = Math.max(0, Math.floor(seconds || 0));
@@ -2580,7 +2565,7 @@ function App() {
                     onChange: handleFileSelect,
                     preserveSelectedRowKeys: true,
                 }}
-                dataSource={getPageData()}
+                dataSource={pageData}
                 columns={fileColumns}
                 rowKey="id"
                 size="small"
