@@ -29,6 +29,9 @@ def init_db():
                 file_hash TEXT,
                 duration REAL,
                 transcribe_elapsed REAL,
+                transcribe_progress REAL,
+                transcribe_progress_current REAL,
+                transcribe_progress_duration REAL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -38,6 +41,9 @@ def init_db():
         ensure_file_hash_column(conn)
         ensure_detailed_summary_column(conn)
         ensure_transcribe_elapsed_column(conn)
+        ensure_transcribe_progress_column(conn)
+        ensure_transcribe_progress_current_column(conn)
+        ensure_transcribe_progress_duration_column(conn)
         backfill_file_sizes(conn)
         conn.execute(
             """
@@ -112,6 +118,21 @@ def ensure_transcribe_elapsed_column(conn):
     if "transcribe_elapsed" not in columns:
         conn.execute("ALTER TABLE files ADD COLUMN transcribe_elapsed REAL")
 
+def ensure_transcribe_progress_column(conn):
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()]
+    if "transcribe_progress" not in columns:
+        conn.execute("ALTER TABLE files ADD COLUMN transcribe_progress REAL")
+
+def ensure_transcribe_progress_current_column(conn):
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()]
+    if "transcribe_progress_current" not in columns:
+        conn.execute("ALTER TABLE files ADD COLUMN transcribe_progress_current REAL")
+
+def ensure_transcribe_progress_duration_column(conn):
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()]
+    if "transcribe_progress_duration" not in columns:
+        conn.execute("ALTER TABLE files ADD COLUMN transcribe_progress_duration REAL")
+
 
 def backfill_file_sizes(conn):
     rows = conn.execute("SELECT id, stored_name FROM files WHERE file_size IS NULL").fetchall()
@@ -122,10 +143,15 @@ def backfill_file_sizes(conn):
             conn.execute("UPDATE files SET file_size = ? WHERE id = ?", (size, row["id"]))
 
 
-def row_to_file(row):
+def row_to_file(row, include_transcription: bool = True):
     if not row:
         return None
-    transcription = json.loads(row["transcription"]) if row["transcription"] else None
+    transcription = None
+    if include_transcription:
+        transcription = json.loads(row["transcription"]) if row["transcription"] else None
+    has_transcription = row["has_transcription"] if "has_transcription" in row.keys() else None
+    if has_transcription is None:
+        has_transcription = bool(transcription)
     return {
         "id": row["id"],
         "name": row["name"],
@@ -134,6 +160,7 @@ def row_to_file(row):
         "url": row["url"],
         "status": row["status"],
         "transcription": transcription,
+        "hasTranscription": bool(has_transcription),
         "summary": row["summary"] or "",
         "detailedSummary": row["detailed_summary"] or "",
         "mindmapData": row["mindmap_data"],
@@ -141,16 +168,59 @@ def row_to_file(row):
         "fileHash": row["file_hash"],
         "duration": row["duration"] or 0,
         "transcribeElapsed": row["transcribe_elapsed"],
+        "transcribeProgress": row["transcribe_progress"],
+        "transcribeProgressCurrent": row["transcribe_progress_current"],
+        "transcribeProgressDuration": row["transcribe_progress_duration"],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
 
 
-def list_files():
+def list_files(include_transcription: bool = True):
     conn = get_connection()
     try:
-        rows = conn.execute("SELECT * FROM files ORDER BY created_at ASC").fetchall()
-        return [row_to_file(row) for row in rows]
+        if include_transcription:
+            rows = conn.execute("SELECT * FROM files ORDER BY created_at ASC").fetchall()
+            return [row_to_file(row, include_transcription=True) for row in rows]
+        rows = conn.execute(
+            """
+            SELECT
+                id, name, type, stored_name, url, status, summary, detailed_summary,
+                mindmap_data, file_size, file_hash, duration, transcribe_elapsed,
+                transcribe_progress, transcribe_progress_current, transcribe_progress_duration,
+                created_at, updated_at,
+                CASE WHEN transcription IS NOT NULL AND LENGTH(transcription) > 0 THEN 1 ELSE 0 END AS has_transcription
+            FROM files
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+        return [row_to_file(row, include_transcription=False) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_next_queued_file():
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM files WHERE status = ? ORDER BY updated_at ASC, created_at ASC LIMIT 1",
+            ("queued",),
+        ).fetchone()
+        return row_to_file(row, include_transcription=True)
+    finally:
+        conn.close()
+
+
+def update_status_by_status(from_status: str, to_status: str):
+    conn = get_connection()
+    try:
+        now = datetime.utcnow().isoformat()
+        cursor = conn.execute(
+            "UPDATE files SET status = ?, updated_at = ? WHERE status = ?",
+            (to_status, now, from_status),
+        )
+        conn.commit()
+        return cursor.rowcount
     finally:
         conn.close()
 
@@ -159,7 +229,7 @@ def get_file(file_id: str):
     conn = get_connection()
     try:
         row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
-        return row_to_file(row)
+        return row_to_file(row, include_transcription=True)
     finally:
         conn.close()
 
@@ -183,6 +253,18 @@ def find_duplicate_file(name: str, file_size: int, file_hash: str = None):
         conn.close()
 
 
+def find_file_by_path(stored_name: str):
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM files WHERE stored_name = ? LIMIT 1",
+            (stored_name,),
+        ).fetchone()
+        return row_to_file(row)
+    finally:
+        conn.close()
+
+
 def insert_file(file_data: dict):
     now = datetime.utcnow().isoformat()
     conn = get_connection()
@@ -192,8 +274,10 @@ def insert_file(file_data: dict):
             INSERT INTO files (
                 id, name, type, stored_name, url, status,
                 transcription, summary, detailed_summary, mindmap_data,
-                file_size, file_hash, duration, transcribe_elapsed, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                file_size, file_hash, duration, transcribe_elapsed,
+                transcribe_progress, transcribe_progress_current, transcribe_progress_duration,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 file_data["id"],
@@ -210,6 +294,9 @@ def insert_file(file_data: dict):
                 file_data.get("fileHash"),
                 file_data.get("duration", 0),
                 file_data.get("transcribeElapsed"),
+                file_data.get("transcribeProgress"),
+                file_data.get("transcribeProgressCurrent"),
+                file_data.get("transcribeProgressDuration"),
                 now,
                 now,
             ),

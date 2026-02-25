@@ -11,18 +11,29 @@ from datetime import datetime
 import time
 import logging
 import hashlib
-from backend.services.stt_service import transcribe_audio, stop_transcription, is_file_being_transcribed, get_transcription_progress
+import mimetypes
+from backend.services.stt_service import transcribe_audio, stop_transcription, pause_transcription, resume_transcription, is_file_being_transcribed, get_transcription_progress
 from backend.services.ai_service import generate_summary, generate_mindmap, chat_with_model, generate_detailed_summary
 from backend.models import ChatMessage, ChatRequest
 import asyncio
 import uuid
 import json
-from backend.db import init_db, list_files, get_file, insert_file, update_file, delete_file_with_related, get_merged_summary, upsert_merged_summary, get_merged_detailed_summary, upsert_merged_detailed_summary, find_duplicate_file, get_merged_mindmap, upsert_merged_mindmap, get_chat_history, upsert_chat_history
+from backend.db import init_db, list_files, get_file, insert_file, update_file, delete_file_with_related, get_merged_summary, upsert_merged_summary, get_merged_detailed_summary, upsert_merged_detailed_summary, find_duplicate_file, find_file_by_path, get_merged_mindmap, upsert_merged_mindmap, get_chat_history, upsert_chat_history, get_next_queued_file, update_status_by_status
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("videochat")
 
 app = FastAPI()
+
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".mov", ".avi", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".wmv",
+    ".ts", ".m2ts", ".mts", ".3gp", ".3g2", ".rm", ".rmvb", ".vob", ".ogv", ".mxf",
+    ".f4v", ".asf",
+}
+AUDIO_EXTENSIONS = {
+    ".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".opus", ".wma", ".amr",
+    ".aiff", ".aif", ".alac", ".ape", ".mka", ".m4b", ".m4r", ".caf",
+}
 
 async def persist_upload_file(file: UploadFile, destination: str, compute_hash: bool = False):
     file_size = 0
@@ -47,6 +58,45 @@ def sanitize_filename(filename: Optional[str]) -> str:
     base = os.path.basename(filename)
     base = base.replace("\\", "_").replace("/", "_")
     return base.strip()
+
+def compute_file_hash(file_path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def detect_media_type(file_path: str) -> Optional[str]:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in VIDEO_EXTENSIONS:
+        return "video"
+    if ext in AUDIO_EXTENSIONS:
+        return "audio"
+    mime_type, _ = mimetypes.guess_type(file_path)
+    if mime_type:
+        if mime_type.startswith("video/"):
+            return "video"
+        if mime_type.startswith("audio/"):
+            return "audio"
+    return None
+
+def resolve_file_path(file_record: dict) -> Optional[str]:
+    stored_name = file_record.get("storedName")
+    if not stored_name:
+        return None
+    if os.path.isabs(stored_name) or stored_name.startswith("\\\\"):
+        return stored_name
+    return os.path.join("uploads", stored_name)
+
+def is_uploads_path(file_path: str) -> bool:
+    uploads_dir = os.path.abspath("uploads")
+    try:
+        return os.path.commonpath([uploads_dir, os.path.abspath(file_path)]) == uploads_dir
+    except ValueError:
+        return False
 
 def schedule_delete_on_reboot(file_path: str) -> bool:
     if os.name != "nt":
@@ -86,6 +136,7 @@ async def cancel_transcription_for_file(file_id: str, file_path: str):
         pass
     transcription_task = None
     current_transcribing_id = None
+    clear_transcribe_timer(file_id)
 
 # 添加静态文件服务
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
@@ -135,9 +186,85 @@ async def log_requests(request: Request, call_next):
 # 添加一个变量来跟踪转录任务
 transcription_task = None
 current_transcribing_id = None
+transcribe_timers = {}
+queue_task = None
+queue_lock = asyncio.Lock()
+
+def get_transcribe_elapsed(file_id: str):
+    timer = transcribe_timers.get(file_id)
+    if not timer:
+        return None
+    base = float(timer.get("base") or 0.0)
+    start = timer.get("start")
+    if start is None:
+        return base
+    return base + (time.monotonic() - start)
+
+def set_transcribe_timer(file_id: str, base: float = 0.0, start: float = None):
+    transcribe_timers[file_id] = {
+        "base": float(base or 0.0),
+        "start": start,
+    }
+
+def pause_transcribe_timer(file_id: str):
+    elapsed = get_transcribe_elapsed(file_id)
+    if elapsed is None:
+        return None
+    timer = transcribe_timers.get(file_id)
+    if timer is not None:
+        timer["base"] = elapsed
+        timer["start"] = None
+    return elapsed
+
+def resume_transcribe_timer(file_id: str):
+    timer = transcribe_timers.get(file_id)
+    if timer is None:
+        set_transcribe_timer(file_id, 0.0, time.monotonic())
+    else:
+        timer["start"] = time.monotonic()
+    return get_transcribe_elapsed(file_id)
+
+def clear_transcribe_timer(file_id: str):
+    if file_id in transcribe_timers:
+        del transcribe_timers[file_id]
+
+
+async def process_transcribe_queue():
+    global queue_task
+    try:
+        while True:
+            if transcription_task and not transcription_task.cancelled():
+                await asyncio.sleep(0.5)
+                continue
+            next_file = get_next_queued_file()
+            if not next_file:
+                break
+            file_id = next_file.get("id")
+            if not file_id:
+                break
+            try:
+                await transcribe_file(file_id)
+            except HTTPException:
+                update_file(file_id, {"status": "error"})
+            except Exception:
+                update_file(file_id, {"status": "error"})
+                await asyncio.sleep(0)
+    finally:
+        queue_task = None
+
+
+async def ensure_queue_worker():
+    global queue_task
+    async with queue_lock:
+        if queue_task is None or queue_task.done():
+            queue_task = asyncio.create_task(process_transcribe_queue())
 
 class TextRequest(BaseModel):
     text: str
+
+
+class QueueRequest(BaseModel):
+    fileIds: List[str]
 
 
 class MergedSummaryRequest(BaseModel):
@@ -160,9 +287,14 @@ class ChatHistoryRequest(BaseModel):
     messages: List[ChatMessage]
 
 
+class ScanRequest(BaseModel):
+    directory: str
+
+
 @app.on_event("startup")
 async def startup_event():
     init_db()
+    await ensure_queue_worker()
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -209,7 +341,83 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.get("/api/files")
 async def get_files():
-    return {"files": list_files()}
+    return {"files": list_files(include_transcription=False)}
+
+
+@app.post("/api/transcribe-queue")
+async def start_transcribe_queue(request: QueueRequest):
+    file_ids = [file_id for file_id in (request.fileIds or []) if file_id]
+    if not file_ids:
+        raise HTTPException(status_code=400, detail="No files selected")
+    queued_ids = []
+    for file_id in file_ids:
+        record = get_file(file_id)
+        if not record:
+            continue
+        if record.get("status") == "done":
+            continue
+        if record.get("status") == "transcribing":
+            continue
+        update_file(file_id, {"status": "queued"})
+        queued_ids.append(file_id)
+    await ensure_queue_worker()
+    return {"queued": queued_ids}
+
+
+@app.get("/api/files/{file_id}")
+async def get_file_record(file_id: str):
+    file_record = get_file(file_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File not found")
+    return file_record
+
+
+@app.post("/api/files/scan")
+async def scan_local_files(request: ScanRequest):
+    directory = request.directory.strip() if request.directory else ""
+    if not directory:
+        raise HTTPException(status_code=400, detail="Directory is required")
+    if not os.path.isdir(directory):
+        raise HTTPException(status_code=400, detail="Directory not found")
+
+    added = []
+    skipped = 0
+    for root, _, files in os.walk(directory):
+        for filename in files:
+            full_path = os.path.join(root, filename)
+            media_type = detect_media_type(full_path)
+            if not media_type:
+                continue
+            try:
+                file_size = os.path.getsize(full_path)
+            except OSError:
+                continue
+            safe_name = sanitize_filename(filename) or filename
+            existing = find_file_by_path(os.path.abspath(full_path))
+            if existing:
+                skipped += 1
+                continue
+            file_id = uuid.uuid4().hex
+            abs_path = os.path.abspath(full_path)
+            record = {
+                "id": file_id,
+                "name": safe_name,
+                "type": media_type,
+                "storedName": abs_path,
+                "url": f"/api/files/{file_id}/media",
+                "status": "waiting",
+                "transcription": None,
+                "summary": "",
+                "detailedSummary": "",
+                "mindmapData": None,
+                "fileSize": file_size,
+                "fileHash": None,
+                "duration": 0,
+                "transcribeElapsed": None,
+            }
+            insert_file(record)
+            added.append(record)
+    return {"added": len(added), "skipped": skipped, "files": added}
 
 
 @app.get("/api/merged-summary/{selection_key}")
@@ -317,13 +525,18 @@ async def upload_file_record(file: UploadFile = File(...)):
 
 @app.delete("/api/files/{file_id}")
 async def remove_file(file_id: str, background_tasks: BackgroundTasks):
-    stored_name = delete_file_with_related(file_id)
-    if stored_name is None:
+    file_record = get_file(file_id)
+    if not file_record:
         raise HTTPException(status_code=404, detail="File not found")
+    stored_name = delete_file_with_related(file_id)
     if stored_name:
-        file_path = os.path.join("uploads", stored_name)
-        if os.path.exists(file_path):
+        file_path = resolve_file_path(file_record) or (
+            stored_name if os.path.isabs(stored_name) or stored_name.startswith("\\\\") else os.path.join("uploads", stored_name)
+        )
+        if file_path:
             await cancel_transcription_for_file(file_id, file_path)
+        is_scanned = str(file_record.get("url") or "").startswith("/api/files/")
+        if not is_scanned and file_path and os.path.exists(file_path) and is_uploads_path(file_path):
             try:
                 os.remove(file_path)
             except (PermissionError, OSError):
@@ -357,28 +570,78 @@ async def transcribe_file(file_id: str):
     if not file_record:
         raise HTTPException(status_code=404, detail="File not found")
 
-    file_path = os.path.join("uploads", file_record["storedName"])
-    if not os.path.exists(file_path):
+    file_path = resolve_file_path(file_record)
+    if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found on disk")
 
-    start_time = time.monotonic()
-    update_file(file_id, {"status": "transcribing", "transcribe_elapsed": None})
+    existing_transcription = file_record.get("transcription")
+    resume_offset = None
+    if isinstance(existing_transcription, list) and existing_transcription:
+        last_segment = existing_transcription[-1]
+        if isinstance(last_segment, dict):
+            last_end = last_segment.get("end")
+            if isinstance(last_end, (int, float)):
+                resume_offset = float(last_end)
+    if resume_offset is None:
+        stored_current = file_record.get("transcribeProgressCurrent")
+        if isinstance(stored_current, (int, float)):
+            resume_offset = float(stored_current)
+    resume_duration = file_record.get("transcribeProgressDuration")
+    resume_progress = None
+    if resume_offset and isinstance(resume_duration, (int, float)) and resume_duration > 0:
+        resume_progress = min((resume_offset / resume_duration) * 100.0, 100.0)
+    existing_elapsed = file_record.get("transcribeElapsed")
+    elapsed_base = existing_elapsed if isinstance(existing_elapsed, (int, float)) else 0.0
+    set_transcribe_timer(file_id, elapsed_base, time.monotonic())
+
+    update_file(file_id, {
+        "status": "transcribing",
+        "transcribe_elapsed": elapsed_base,
+        "transcribe_progress": resume_progress if resume_progress is not None else 0.0,
+        "transcribe_progress_current": resume_offset or 0.0,
+        "transcribe_progress_duration": resume_duration,
+    })
     current_transcribing_id = file_id
-    transcription_task = asyncio.create_task(transcribe_audio(file_path))
+    def persist_transcription_snapshot(data, progress=None):
+        fields = {"transcription": json.dumps(data)}
+        if isinstance(progress, dict):
+            if "progress" in progress:
+                fields["transcribe_progress"] = progress.get("progress")
+            if "current" in progress:
+                fields["transcribe_progress_current"] = progress.get("current")
+            if "duration" in progress:
+                fields["transcribe_progress_duration"] = progress.get("duration")
+        elapsed_value = get_transcribe_elapsed(file_id)
+        if elapsed_value is not None:
+            fields["transcribe_elapsed"] = elapsed_value
+        update_file(file_id, fields)
+
+    transcription_task = asyncio.create_task(transcribe_audio(
+        file_path,
+        on_update=persist_transcription_snapshot,
+        start_offset=resume_offset,
+        initial_transcription=existing_transcription if resume_offset and isinstance(existing_transcription, list) else None,
+    ))
 
     try:
         transcription = await transcription_task
         transcription_task = None
         current_transcribing_id = None
-        elapsed = time.monotonic() - start_time
-        update_file(file_id, {"status": "done", "transcription": json.dumps(transcription), "transcribe_elapsed": elapsed})
+        elapsed = get_transcribe_elapsed(file_id)
+        clear_transcribe_timer(file_id)
+        update_file(file_id, {
+            "status": "done",
+            "transcription": json.dumps(transcription),
+            "transcribe_elapsed": elapsed,
+        })
         return {"transcription": transcription}
     except asyncio.CancelledError:
         if not transcription_task.cancelled():
             transcription_task.cancel()
         transcription_task = None
         current_transcribing_id = None
-        elapsed = time.monotonic() - start_time
+        elapsed = pause_transcribe_timer(file_id)
+        clear_transcribe_timer(file_id)
         update_file(file_id, {"status": "interrupted", "transcribe_elapsed": elapsed})
         return JSONResponse(
             status_code=499,
@@ -389,9 +652,72 @@ async def transcribe_file(file_id: str):
             transcription_task.cancel()
         transcription_task = None
         current_transcribing_id = None
-        elapsed = time.monotonic() - start_time
+        elapsed = pause_transcribe_timer(file_id)
+        clear_transcribe_timer(file_id)
         update_file(file_id, {"status": "error", "transcribe_elapsed": elapsed})
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/files/{file_id}/pause")
+async def pause_file_transcription(file_id: str):
+    global transcription_task, current_transcribing_id
+    file_record = get_file(file_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File not found")
+    if file_record.get("status") != "transcribing":
+        raise HTTPException(status_code=400, detail="File is not transcribing")
+    file_path = resolve_file_path(file_record)
+    running = False
+    if file_path and (current_transcribing_id == file_id or is_file_being_transcribed(file_path)):
+        running = True
+    if running and file_record.get("transcription"):
+        update_file(file_id, {"transcription": json.dumps(file_record["transcription"])})
+    progress = get_transcription_progress(file_path) if running and file_path else None
+    if progress:
+        update_file(file_id, {
+            "transcribe_progress": progress.get("progress"),
+            "transcribe_progress_current": progress.get("current"),
+            "transcribe_progress_duration": progress.get("duration"),
+        })
+    elapsed = pause_transcribe_timer(file_id) if running else file_record.get("transcribeElapsed")
+    if running:
+        pause_transcription()
+    update_file(file_id, {"status": "paused", "transcribe_elapsed": elapsed})
+    stored_progress = file_record.get("transcribeProgress")
+    stored_current = file_record.get("transcribeProgressCurrent")
+    stored_duration = file_record.get("transcribeProgressDuration")
+    return {
+        "message": "Transcription paused",
+        "progress": progress.get("progress") if progress else stored_progress,
+        "current": progress.get("current") if progress else stored_current,
+        "duration": progress.get("duration") if progress else stored_duration,
+        "elapsed": elapsed,
+    }
+
+
+@app.post("/api/files/{file_id}/resume")
+async def resume_file_transcription(file_id: str, background_tasks: BackgroundTasks):
+    global transcription_task, current_transcribing_id
+    file_record = get_file(file_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File not found")
+    if file_record.get("status") not in {"paused", "interrupted"}:
+        raise HTTPException(status_code=400, detail="File is not paused")
+    file_path = resolve_file_path(file_record)
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+    running = current_transcribing_id == file_id or is_file_being_transcribed(file_path)
+    if running:
+        elapsed = resume_transcribe_timer(file_id)
+        resume_transcription()
+        update_file(file_id, {"status": "transcribing", "transcribe_elapsed": elapsed})
+        return {"message": "Transcription resumed"}
+    if transcription_task and not transcription_task.cancelled():
+        raise HTTPException(status_code=400, detail="Another transcription is running")
+    async def restart():
+        await transcribe_file(file_id)
+    background_tasks.add_task(restart)
+    return {"message": "Transcription restarted"}
 
 
 @app.get("/api/files/{file_id}/transcribe-progress")
@@ -399,17 +725,23 @@ async def get_transcribe_progress(file_id: str):
     file_record = get_file(file_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="File not found")
-
-    file_path = os.path.join("uploads", file_record["storedName"])
-    progress = get_transcription_progress(file_path)
-    if not progress:
-        return {"progress": None, "status": file_record["status"]}
     return {
-        "progress": progress.get("progress"),
-        "duration": progress.get("duration"),
-        "current": progress.get("current"),
-        "status": progress.get("status"),
+        "progress": file_record.get("transcribeProgress"),
+        "duration": file_record.get("transcribeProgressDuration"),
+        "current": file_record.get("transcribeProgressCurrent"),
+        "status": file_record.get("status"),
     }
+
+
+@app.get("/api/files/{file_id}/media")
+async def get_file_media(file_id: str):
+    file_record = get_file(file_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File not found")
+    file_path = resolve_file_path(file_record)
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+    return FileResponse(path=file_path, filename=file_record.get("name") or os.path.basename(file_path))
 
 
 @app.post("/api/files/{file_id}/summary")
@@ -601,7 +933,7 @@ async def export_transcription(format: str, transcription: List[dict]):
 
 @app.post("/api/stop-transcribe")
 async def stop_transcribe():
-    global transcription_task, current_transcribing_id
+    global transcription_task, current_transcribing_id, queue_task
     try:
         # 先设置停止标志
         stop_transcription()
@@ -615,8 +947,14 @@ async def stop_transcribe():
                 pass
             transcription_task = None
         if current_transcribing_id:
-            update_file(current_transcribing_id, {"status": "interrupted"})
+            elapsed = pause_transcribe_timer(current_transcribing_id)
+            update_file(current_transcribing_id, {"status": "interrupted", "transcribe_elapsed": elapsed})
+            clear_transcribe_timer(current_transcribing_id)
             current_transcribing_id = None
+        update_status_by_status("queued", "waiting")
+        if queue_task and not queue_task.done():
+            queue_task.cancel()
+            queue_task = None
             
         return {"message": "Transcription stopped"}
     except Exception as e:

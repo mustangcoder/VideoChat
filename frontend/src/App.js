@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Layout, Upload, Button, Input, Card, message, Table, Tabs, Pagination, Checkbox, Modal } from 'antd';
-import { UploadOutlined, SendOutlined, SoundOutlined, SyncOutlined, DownloadOutlined, CopyOutlined, StopOutlined, DeleteOutlined, GithubOutlined, ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
+import { UploadOutlined, SendOutlined, SoundOutlined, DownloadOutlined, CopyOutlined, StopOutlined, DeleteOutlined, GithubOutlined, ArrowUpOutlined, ArrowDownOutlined, PauseOutlined, PlayCircleOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import Mermaid from 'mermaid';
 import './App.css';
@@ -242,15 +242,20 @@ function App() {
     const [now, setNow] = useState(Date.now());
     const averageSpeedRef = useRef({ totalFactor: 0, count: 0 });
     const emptyMessagesRef = useRef([]);
+    const loadingFileDetailsRef = useRef(new Set());
+    const abortTranscribingRef = useRef(false);
     const [activeFeatureTab, setActiveFeatureTab] = useState('1');
     const [activeMediaTab, setActiveMediaTab] = useState('1');
+    const [scanDirectory, setScanDirectory] = useState('');
+    const [scanLoading, setScanLoading] = useState(false);
     const [fileColumnWidths, setFileColumnWidths] = useState({
         name: 420,
         type: 120,
+        progress: 180,
         duration: 120,
         status: 160,
         remaining: 160,
-        action: 100,
+        action: 180,
     });
 
     // 打印 uploadedFiles 的变化
@@ -259,31 +264,91 @@ function App() {
     }, [uploadedFiles]);
 
     useEffect(() => {
-        const loadFiles = async () => {
-            try {
-                const response = await fetch('http://localhost:8000/api/files');
-                if (!response.ok) {
-                    throw new Error('加载文件列表失败');
-                }
-                const data = await response.json();
-                const files = (data.files || []).map(file => ({
-                    ...file,
-                    transcribeStartAt: null,
-                    transcribeProgress: null,
-                    transcribeProgressCurrent: null,
-                    transcribeProgressDuration: null,
-                    transcribeElapsed: typeof file.transcribeElapsed === 'number' ? file.transcribeElapsed : null,
-                }));
-                setUploadedFiles(files);
-            } catch (error) {
-                console.error('Failed to load files:', error);
+        abortTranscribingRef.current = abortTranscribing;
+    }, [abortTranscribing]);
+
+    const normalizeFile = useCallback((file, existing = null) => ({
+        ...(existing || {}),
+        ...file,
+        transcribeStartAt: existing?.transcribeStartAt ?? null,
+        transcribeProgress: typeof file.transcribeProgress === 'number'
+            ? file.transcribeProgress
+            : existing?.transcribeProgress ?? null,
+        transcribeProgressCurrent: typeof file.transcribeProgressCurrent === 'number'
+            ? file.transcribeProgressCurrent
+            : existing?.transcribeProgressCurrent ?? null,
+        transcribeProgressDuration: typeof file.transcribeProgressDuration === 'number'
+            ? file.transcribeProgressDuration
+            : existing?.transcribeProgressDuration ?? null,
+        transcribeElapsed: typeof file.transcribeElapsed === 'number'
+            ? file.transcribeElapsed
+            : existing?.transcribeElapsed ?? null,
+    }), []);
+
+    const hasTranscriptionData = useCallback((file) => (
+        Array.isArray(file?.transcription) && file.transcription.length > 0
+    ), []);
+
+    const hasTranscription = useCallback((file) => {
+        if (!file) return false;
+        if (hasTranscriptionData(file)) return true;
+        return Boolean(file.hasTranscription);
+    }, [hasTranscriptionData]);
+
+    const loadFiles = useCallback(async () => {
+        try {
+            const response = await fetch('http://localhost:8000/api/files');
+            if (!response.ok) {
+                throw new Error('加载文件列表失败');
             }
-        };
+            const data = await response.json();
+            const files = (data.files || []).map(file => normalizeFile(file));
+            setUploadedFiles(files);
+        } catch (error) {
+            console.error('Failed to load files:', error);
+        }
+    }, [normalizeFile]);
+
+    useEffect(() => {
         loadFiles();
-    }, []);
+    }, [loadFiles]);
+
+    const fetchFileDetails = useCallback(async (fileId) => {
+        if (loadingFileDetailsRef.current.has(fileId)) {
+            return null;
+        }
+        loadingFileDetailsRef.current.add(fileId);
+        try {
+            const response = await fetch(`http://localhost:8000/api/files/${fileId}`);
+            if (!response.ok) {
+                throw new Error('加载文件详情失败');
+            }
+            const data = await response.json();
+            setUploadedFiles(prev => prev.map(file => (
+                file.id === fileId ? normalizeFile(data, file) : file
+            )));
+            return data;
+        } catch (error) {
+            console.error('Failed to load file details:', error);
+            return null;
+        } finally {
+            loadingFileDetailsRef.current.delete(fileId);
+        }
+    }, [normalizeFile]);
+
+    const ensureTranscriptionLoaded = useCallback(async (fileId) => {
+        const file = uploadedFiles.find(item => item.id === fileId);
+        if (!file) return null;
+        if (hasTranscriptionData(file)) return file;
+        if (!file.hasTranscription) return null;
+        return fetchFileDetails(fileId);
+    }, [uploadedFiles, fetchFileDetails, hasTranscriptionData]);
 
     const transcribingIds = uploadedFiles.filter(file => file.status === 'transcribing').map(file => file.id);
     const transcribingKey = transcribingIds.join('|');
+    const hasActiveQueue = uploadedFiles.some(file => file.status === 'transcribing' || file.status === 'queued');
+    const selectedRecords = selectedFiles.map(fileId => uploadedFiles.find(file => file.id === fileId)).filter(Boolean);
+    const selectedHasActive = selectedRecords.some(file => file.status === 'transcribing' || file.status === 'queued');
 
     useEffect(() => {
         if (!transcribingKey) {
@@ -318,17 +383,20 @@ function App() {
                     const progressValue = typeof data.progress === 'number' ? data.progress : null;
                     const currentValue = typeof data.current === 'number' ? data.current : null;
                     const durationValue = typeof data.duration === 'number' ? data.duration : null;
+                    const statusValue = typeof data.status === 'string' ? data.status : null;
                     setUploadedFiles(prev => prev.map(file => file.id === fileId ? {
                         ...file,
                         transcribeProgress: progressValue,
                         transcribeProgressCurrent: currentValue,
                         transcribeProgressDuration: durationValue,
+                        status: statusValue || file.status,
                     } : file));
                     setCurrentFile(prev => prev?.id === fileId ? {
                         ...prev,
                         transcribeProgress: progressValue,
                         transcribeProgressCurrent: currentValue,
                         transcribeProgressDuration: durationValue,
+                        status: statusValue || prev.status,
                     } : prev);
                 } catch (error) {
                 }
@@ -341,6 +409,43 @@ function App() {
             clearInterval(timer);
         };
     }, [transcribingKey]);
+
+    useEffect(() => {
+        if (isTranscribing && !hasActiveQueue) {
+            setIsTranscribing(false);
+            message.destroy();
+        }
+    }, [isTranscribing, hasActiveQueue]);
+
+    useEffect(() => {
+        if (!isTranscribing && hasActiveQueue) {
+            setIsTranscribing(true);
+        }
+    }, [isTranscribing, hasActiveQueue]);
+
+    useEffect(() => {
+        if (!transcribingKey || transcribingIds.length === 0) {
+            return;
+        }
+        let stopped = false;
+        const fetchLiveTranscription = async () => {
+            if (transcribingIds.length === 0) {
+                return;
+            }
+            await Promise.all(transcribingIds.map(async (fileId) => {
+                if (stopped) {
+                    return;
+                }
+                await fetchFileDetails(fileId);
+            }));
+        };
+        fetchLiveTranscription();
+        const timer = setInterval(fetchLiveTranscription, 3000);
+        return () => {
+            stopped = true;
+            clearInterval(timer);
+        };
+    }, [transcribingKey, transcribingIds.length, fetchFileDetails]);
 
     // 初始化 Mermaid
     React.useEffect(() => {
@@ -369,8 +474,6 @@ function App() {
         });
     }, []);
 
-    const hasTranscription = (file) => file?.transcription && file.transcription.length > 0;
-
     const areArraysEqual = (left, right) => {
         if (left.length !== right.length) return false;
         return left.every((value, index) => value === right[index]);
@@ -390,7 +493,16 @@ function App() {
             const nextSelection = transcribedIds.length > 0 ? [transcribedIds[0]] : [];
             return areArraysEqual(prev, nextSelection) ? prev : nextSelection;
         });
-    }, [uploadedFiles, currentFile]);
+    }, [uploadedFiles, currentFile, hasTranscription]);
+
+    useEffect(() => {
+        resultSelection.forEach(fileId => {
+            const file = uploadedFiles.find(item => item.id === fileId);
+            if (file?.hasTranscription && !hasTranscriptionData(file)) {
+                ensureTranscriptionLoaded(fileId);
+            }
+        });
+    }, [resultSelection, uploadedFiles, hasTranscriptionData, ensureTranscriptionLoaded]);
 
     const mergedSelectionKey = useMemo(() => resultSelection.join('|'), [resultSelection]);
     const mergedChatKey = useMemo(() => (
@@ -507,6 +619,48 @@ function App() {
         return false; // 阻止自动上传
     };
 
+    const handleScanDirectory = async () => {
+        const targetDirectory = scanDirectory.trim();
+        if (!targetDirectory) {
+            message.warning('请输入目录路径');
+            return;
+        }
+        setScanLoading(true);
+        try {
+            const response = await fetch('http://localhost:8000/api/files/scan', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ directory: targetDirectory }),
+            });
+            if (!response.ok) {
+                let detail = '';
+                try {
+                    const data = await response.json();
+                    detail = data?.detail || '';
+                } catch (error) {
+                    detail = '';
+                }
+                throw new Error(detail || '扫描失败');
+            }
+            const data = await response.json();
+            await loadFiles();
+            const added = Number(data?.added || 0);
+            const skipped = Number(data?.skipped || 0);
+            if (added === 0 && skipped === 0) {
+                message.info('未发现可扫描的音视频文件');
+            } else {
+                message.success(`扫描完成：新增 ${added} 个，已存在 ${skipped} 个`);
+            }
+        } catch (error) {
+            console.error('Scan failed:', error);
+            message.error('扫描失败：' + error.message);
+        } finally {
+            setScanLoading(false);
+        }
+    };
+
     // 处理文件选择
     const handleFileSelect = (fileIds) => {
         setSelectedFiles(fileIds);
@@ -548,6 +702,72 @@ function App() {
         return `${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
     };
 
+    const getProgressMetrics = (record) => {
+        const status = record?.status;
+        const rawCurrent = record?.transcribeProgressCurrent;
+        const rawDuration = record?.transcribeProgressDuration;
+        const fallbackDuration = typeof rawDuration === 'number'
+            ? rawDuration
+            : (typeof record?.duration === 'number' && record.duration > 0 ? record.duration : null);
+        let current = typeof rawCurrent === 'number' ? rawCurrent : null;
+        const duration = fallbackDuration;
+        if (current == null && status === 'done' && typeof duration === 'number') {
+            current = duration;
+        }
+        let progress = typeof record?.transcribeProgress === 'number' ? record.transcribeProgress : null;
+        if (progress == null && typeof current === 'number' && typeof duration === 'number' && duration > 0) {
+            progress = (current / duration) * 100;
+        }
+        if (progress == null && status === 'done') {
+            progress = 100;
+        }
+        return { current, duration, progress };
+    };
+
+    const getProgressTimeLabel = (record) => {
+        const { current, duration } = getProgressMetrics(record);
+        if (typeof current !== 'number') return '';
+        if (typeof duration === 'number' && duration > 0) {
+            return `${formatDuration(current)} / ${formatDuration(duration)}`;
+        }
+        return formatDuration(current);
+    };
+
+    const getProgressLabel = (record) => {
+        const { progress } = getProgressMetrics(record);
+        const progressText = typeof progress === 'number'
+            ? `${Math.min(100, Math.max(0, Math.round(progress)))}%`
+            : '';
+        const timeLabel = getProgressTimeLabel(record);
+        if (!progressText && !timeLabel) return '—';
+        return [progressText, timeLabel].filter(Boolean).join(' ');
+    };
+
+    const getElapsedSeconds = (record) => {
+        const base = typeof record?.transcribeElapsed === 'number' ? record.transcribeElapsed : null;
+        if (record?.status === 'transcribing' && base != null && record.transcribeStartAt) {
+            return Math.max(base + (now - record.transcribeStartAt) / 1000, 0);
+        }
+        return base;
+    };
+
+    const getRemainingBySpeed = (record) => {
+        const current = record?.transcribeProgressCurrent;
+        const duration = record?.transcribeProgressDuration;
+        const elapsed = getElapsedSeconds(record);
+        if (typeof current !== 'number' || typeof duration !== 'number' || duration <= 0) {
+            return null;
+        }
+        if (typeof elapsed !== 'number' || elapsed <= 0) {
+            return null;
+        }
+        const speed = current / elapsed;
+        if (!Number.isFinite(speed) || speed <= 0) {
+            return null;
+        }
+        return Math.max((duration - current) / speed, 0);
+    };
+
     const getAverageSpeedFactor = () => {
         const { totalFactor, count } = averageSpeedRef.current;
         return count > 0 ? totalFactor / count : 1;
@@ -559,8 +779,9 @@ function App() {
     };
 
     const getTranscribingRemainingSeconds = (file) => {
-        if (file?.transcribeProgressDuration != null && file?.transcribeProgressCurrent != null) {
-            return Math.max(file.transcribeProgressDuration - file.transcribeProgressCurrent, 0);
+        const speedRemaining = getRemainingBySpeed(file);
+        if (speedRemaining != null) {
+            return speedRemaining;
         }
         const total = getEstimatedTotalSeconds(file);
         if (!total || !file?.transcribeStartAt) return null;
@@ -591,6 +812,11 @@ function App() {
         return null;
     };
 
+    const isScannedFile = useCallback((file) => {
+        const url = file?.url || '';
+        return typeof url === 'string' && url.startsWith('/api/files/');
+    }, []);
+
     // 文件列表列定
     const fileColumns = [
         {
@@ -598,6 +824,16 @@ function App() {
             dataIndex: 'name',
             key: 'name',
             width: fileColumnWidths.name,
+            render: (name, record) => (
+                <div className="file-name-cell">
+                    <span className="file-name-text">{name}</span>
+                    {isScannedFile(record) ? (
+                        <span className="file-source-tag">扫描</span>
+                    ) : (
+                        <span className="file-source-tag upload">上传</span>
+                    )}
+                </div>
+            ),
         },
         {
             title: '类型',
@@ -607,22 +843,6 @@ function App() {
             render: (type) => type === 'video' ? '视频' : '音频',
         },
         {
-            title: '耗时',
-            dataIndex: 'duration',
-            key: 'duration',
-            width: fileColumnWidths.duration,
-            render: (duration, record) => {
-                if (record.status === 'transcribing' && record.transcribeStartAt) {
-                    const elapsedSeconds = Math.max((now - record.transcribeStartAt) / 1000, 0);
-                    return formatDuration(elapsedSeconds);
-                }
-                if (record.transcribeElapsed != null) {
-                    return formatDuration(record.transcribeElapsed);
-                }
-                return '—';
-            },
-        },
-        {
             title: '状态',
             dataIndex: 'status',
             key: 'status',
@@ -630,17 +850,33 @@ function App() {
             render: (status, record) => {
                 switch (status) {
                     case 'waiting': return '等待转录';
-                    case 'transcribing': {
-                        const progress = typeof record?.transcribeProgress === 'number'
-                            ? `${Math.min(100, Math.max(0, Math.round(record.transcribeProgress)))}%`
-                            : '';
-                        return <><SyncOutlined spin /> 转录中{progress ? ` ${progress}` : ''}</>;
-                    }
+                    case 'queued': return <span style={{ color: '#8c8c8c' }}>排队中</span>;
+                    case 'transcribing': return '转录中';
+                    case 'paused': return <span style={{ color: '#faad14' }}>暂停中</span>;
                     case 'done': return <span style={{ color: '#52c41a' }}>已完成</span>;
                     case 'error': return <span style={{ color: '#ff4d4f' }}>失败</span>;
                     case 'interrupted': return <span style={{ color: '#faad14' }}>转录中断</span>;
                     default: return status;
                 }
+            },
+        },
+        {
+            title: '进度',
+            key: 'progress',
+            width: fileColumnWidths.progress,
+            render: (_, record) => getProgressLabel(record),
+        },
+        {
+            title: '耗时',
+            dataIndex: 'duration',
+            key: 'duration',
+            width: fileColumnWidths.duration,
+            render: (duration, record) => {
+                const elapsedSeconds = getElapsedSeconds(record);
+                if (elapsedSeconds != null) {
+                    return formatDuration(elapsedSeconds);
+                }
+                return '—';
             },
         },
         {
@@ -650,11 +886,15 @@ function App() {
             render: (_, record) => {
                 if (record.status === 'done') return '已完成';
                 if (record.status === 'error') return '—';
+                if (record.status === 'paused') {
+                    const remaining = getRemainingBySpeed(record);
+                    return remaining == null ? '—' : formatDuration(Math.ceil(remaining));
+                }
                 if (record.status === 'transcribing') {
                     const remaining = getTranscribingRemainingSeconds(record);
                     return remaining == null ? '计算中' : formatDuration(Math.ceil(remaining));
                 }
-                if (record.status === 'waiting' || record.status === 'interrupted') {
+                if (record.status === 'waiting' || record.status === 'interrupted' || record.status === 'queued') {
                     if (!selectedFiles.includes(record.id)) return '—';
                     const queueRemaining = getQueueRemainingSeconds(record);
                     return queueRemaining == null ? '计算中' : formatDuration(Math.ceil(queueRemaining));
@@ -667,18 +907,55 @@ function App() {
             key: 'action',
             width: fileColumnWidths.action,
             render: (_, record) => (
-                <Button
-                    type="text"
-                    danger
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        handleFileDelete(record.id);
-                    }}
-                    icon={<DeleteOutlined />}
-                    disabled={record.status === 'transcribing'}
-                >
-                    删除
-                </Button>
+                <div className="file-action-buttons">
+                    {record.status === 'transcribing' && (
+                        <Button
+                            type="text"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                handlePauseTranscribe(record.id);
+                            }}
+                            icon={<PauseOutlined />}
+                        >
+                            暂停
+                        </Button>
+                    )}
+                    {record.status === 'paused' && (
+                        <Button
+                            type="text"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                handleResumeTranscribe(record.id);
+                            }}
+                            icon={<PlayCircleOutlined />}
+                        >
+                            继续
+                        </Button>
+                    )}
+                    {record.status === 'interrupted' && (
+                        <Button
+                            type="text"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                handleRestartTranscribe(record.id);
+                            }}
+                            icon={<PlayCircleOutlined />}
+                        >
+                            继续
+                        </Button>
+                    )}
+                    <Button
+                        type="text"
+                        danger
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            handleFileDelete(record.id);
+                        }}
+                        icon={<DeleteOutlined />}
+                    >
+                        删除
+                    </Button>
+                </div>
             ),
         },
     ].map((column) => ({
@@ -733,9 +1010,12 @@ function App() {
             }
         };
         const targetFile = uploadedFiles.find(file => file.id === fileId);
+        const sourceTip = targetFile && isScannedFile(targetFile)
+            ? '原始文件不会被删除，仅移除本地记录。'
+            : '文件将从服务端存储中删除。';
         const tipContent = targetFile
-            ? `即将删除文件“${targetFile.name}”，删除后将同时删除关联的总结、详细总结、思维导图、对话内容。`
-            : '删除后将同时删除关联的总结、详细总结、思维导图、对话内容。';
+            ? `即将删除文件“${targetFile.name}”，删除后将同时删除关联的总结、详细总结、思维导图、对话内容。${sourceTip}`
+            : `删除后将同时删除关联的总结、详细总结、思维导图、对话内容。${sourceTip}`;
         confirmDeleteWithTip(async () => {
             try {
                 await fetch(`http://localhost:8000/api/files/${fileId}`, { method: 'DELETE' });
@@ -747,6 +1027,96 @@ function App() {
         }, tipContent);
     };
 
+    const handlePauseTranscribe = async (fileId) => {
+        try {
+            const response = await fetch(`http://localhost:8000/api/files/${fileId}/pause`, {
+                method: 'POST',
+            });
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                throw new Error(data?.detail || '暂停失败');
+            }
+            const data = await response.json().catch(() => ({}));
+            const progressValue = typeof data.progress === 'number' ? data.progress : null;
+            const currentValue = typeof data.current === 'number' ? data.current : null;
+            const durationValue = typeof data.duration === 'number' ? data.duration : null;
+            const elapsedValue = typeof data.elapsed === 'number' ? data.elapsed : null;
+            setUploadedFiles(prev => prev.map(file => file.id === fileId ? {
+                ...file,
+                status: 'paused',
+                transcribeStartAt: null,
+                transcribeProgress: progressValue ?? file.transcribeProgress,
+                transcribeProgressCurrent: currentValue ?? file.transcribeProgressCurrent,
+                transcribeProgressDuration: durationValue ?? file.transcribeProgressDuration,
+                transcribeElapsed: elapsedValue ?? file.transcribeElapsed,
+            } : file));
+            setCurrentFile(prev => prev?.id === fileId ? {
+                ...prev,
+                status: 'paused',
+                transcribeStartAt: null,
+                transcribeProgress: progressValue ?? prev.transcribeProgress,
+                transcribeProgressCurrent: currentValue ?? prev.transcribeProgressCurrent,
+                transcribeProgressDuration: durationValue ?? prev.transcribeProgressDuration,
+                transcribeElapsed: elapsedValue ?? prev.transcribeElapsed,
+            } : prev);
+        } catch (error) {
+            console.error('Pause failed:', error);
+            message.error('暂停失败：' + error.message);
+        }
+    };
+
+    const handleResumeTranscribe = async (fileId) => {
+        try {
+            const response = await fetch(`http://localhost:8000/api/files/${fileId}/resume`, {
+                method: 'POST',
+            });
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                throw new Error(data?.detail || '继续失败');
+            }
+            setUploadedFiles(prev => prev.map(file => file.id === fileId ? {
+                ...file,
+                status: 'transcribing',
+                transcribeStartAt: Date.now(),
+            } : file));
+            setCurrentFile(prev => prev?.id === fileId ? {
+                ...prev,
+                status: 'transcribing',
+                transcribeStartAt: Date.now(),
+            } : prev);
+        } catch (error) {
+            console.error('Resume failed:', error);
+            message.error('继续失败：' + error.message);
+        }
+    };
+
+    const handleRestartTranscribe = async (fileId) => {
+        try {
+            const response = await fetch(`http://localhost:8000/api/files/${fileId}/resume`, {
+                method: 'POST',
+            });
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                throw new Error(data?.detail || '继续失败');
+            }
+            setUploadedFiles(prev => prev.map(file => file.id === fileId ? {
+                ...file,
+                status: 'transcribing',
+                transcribeStartAt: Date.now(),
+                transcribeElapsed: typeof file.transcribeElapsed === 'number' ? file.transcribeElapsed : 0,
+            } : file));
+            setCurrentFile(prev => prev?.id === fileId ? {
+                ...prev,
+                status: 'transcribing',
+                transcribeStartAt: Date.now(),
+                transcribeElapsed: typeof prev.transcribeElapsed === 'number' ? prev.transcribeElapsed : 0,
+            } : prev);
+        } catch (error) {
+            console.error('Restart failed:', error);
+            message.error('继续失败：' + error.message);
+        }
+    };
+
     // 修改文件预览函数
     const handleFilePreview = (file) => {
         const currentFileRef = uploadedFiles.find(f => f.id === file.id);
@@ -756,7 +1126,7 @@ function App() {
 
     // 修改批量转录函数
     const handleBatchTranscribe = async () => {
-        if (isTranscribing) {
+        if (selectedHasActive) {
             setIsTranscribing(false);  // 立即更新状态
             setAbortTranscribing(true);
 
@@ -770,9 +1140,9 @@ function App() {
                 }
 
                 // 只将正在转录的文件状态改为中断
-                setUploadedFiles(prev => prev.map(f =>
-                    f.status === 'transcribing'
-                        ? {
+                setUploadedFiles(prev => prev.map(f => {
+                    if (f.status === 'transcribing') {
+                        return {
                             ...f,
                             status: 'interrupted',
                             transcribeStartAt: null,
@@ -780,18 +1150,30 @@ function App() {
                             transcribeProgressCurrent: null,
                             transcribeProgressDuration: null,
                             transcribeElapsed: f.transcribeStartAt ? Math.max((Date.now() - f.transcribeStartAt) / 1000, 0) : f.transcribeElapsed ?? null,
-                        }
-                        : f
-                ));
-                setCurrentFile(prev => prev?.status === 'transcribing' ? {
-                    ...prev,
-                    status: 'interrupted',
-                    transcribeStartAt: null,
-                    transcribeProgress: null,
-                    transcribeProgressCurrent: null,
-                    transcribeProgressDuration: null,
-                    transcribeElapsed: prev?.transcribeStartAt ? Math.max((Date.now() - prev.transcribeStartAt) / 1000, 0) : prev?.transcribeElapsed ?? null,
-                } : prev);
+                        };
+                    }
+                    if (f.status === 'queued') {
+                        return { ...f, status: 'waiting' };
+                    }
+                    return f;
+                }));
+                setCurrentFile(prev => {
+                    if (prev?.status === 'transcribing') {
+                        return {
+                            ...prev,
+                            status: 'interrupted',
+                            transcribeStartAt: null,
+                            transcribeProgress: null,
+                            transcribeProgressCurrent: null,
+                            transcribeProgressDuration: null,
+                            transcribeElapsed: prev?.transcribeStartAt ? Math.max((Date.now() - prev.transcribeStartAt) / 1000, 0) : prev?.transcribeElapsed ?? null,
+                        };
+                    }
+                    if (prev?.status === 'queued') {
+                        return { ...prev, status: 'waiting' };
+                    }
+                    return prev;
+                });
 
                 message.success('已停止转录');
             } catch (error) {
@@ -808,153 +1190,51 @@ function App() {
             return;
         }
 
+        const queue = selectedFiles.filter(fileId => {
+            const file = uploadedFiles.find(f => f.id === fileId);
+            return file && file.status !== 'done';
+        });
+        if (queue.length === 0) {
+            message.info('选中文件均已完成转录');
+            return;
+        }
+
+        setUploadedFiles(prev => prev.map(f => (
+            queue.includes(f.id) && f.status !== 'done' && f.status !== 'transcribing'
+                ? { ...f, status: 'queued' }
+                : f
+        )));
+
         setIsTranscribing(true);
         setAbortTranscribing(false);
         message.loading('开始转录选中的文件...', 0);
 
         try {
-            for (const fileId of selectedFiles) {
-                // 检查是否已经请求中断
-                if (abortTranscribing) {
-                    // 只将当前在转的文件状态改为中断
-                    setUploadedFiles(prev => prev.map(f =>
-                    f.status === 'transcribing'
-                        ? {
-                            ...f,
-                            status: 'interrupted',
-                            transcribeStartAt: null,
-                            transcribeProgress: null,
-                            transcribeProgressCurrent: null,
-                            transcribeProgressDuration: null,
-                            transcribeElapsed: f.transcribeStartAt ? Math.max((Date.now() - f.transcribeStartAt) / 1000, 0) : f.transcribeElapsed ?? null,
-                        }
-                            : f
-                    ));
-                setCurrentFile(prev => prev?.status === 'transcribing' ? {
-                    ...prev,
-                    status: 'interrupted',
-                    transcribeStartAt: null,
-                    transcribeProgress: null,
-                    transcribeProgressCurrent: null,
-                    transcribeProgressDuration: null,
-                    transcribeElapsed: prev?.transcribeStartAt ? Math.max((Date.now() - prev.transcribeStartAt) / 1000, 0) : prev?.transcribeElapsed ?? null,
-                } : prev);
-                    break;
-                }
-
-                const file = uploadedFiles.find(f => f.id === fileId);
-                if (!file) continue;
-
-                // 修改这里：只跳过已完成的文件，允许中断状态的文件重新转录
-                if (file.status === 'done') {
-                    message.info(`文件 "${file.name}" 已经转录完成，跳过此文件。`);
-                    continue;
-                }
-
-                // 更新文件状态为转录中
-                setUploadedFiles(prev => prev.map(f =>
-                    f.id === fileId ? {
-                        ...f,
-                        status: 'transcribing',
-                        transcribeStartAt: Date.now(),
-                        transcribeProgress: 0,
-                        transcribeProgressCurrent: 0,
-                        transcribeProgressDuration: null,
-                        transcribeElapsed: null,
-                    } : f
-                ));
-
-                try {
-                    const response = await fetch(`http://localhost:8000/api/files/${fileId}/transcribe`, {
-                        method: 'POST',
-                    });
-
-                    const data = await response.json();
-
-                    if (response.status === 499) {
-                        // 处理转录中断的情况，只更新当前文件状态
-                        setUploadedFiles(prev => prev.map(f =>
-                            f.id === fileId
-                                ? {
-                                    ...f,
-                                    status: 'interrupted',
-                                    transcribeStartAt: null,
-                                    transcribeProgress: null,
-                                    transcribeProgressCurrent: null,
-                                    transcribeProgressDuration: null,
-                                    transcribeElapsed: f.transcribeStartAt ? Math.max((Date.now() - f.transcribeStartAt) / 1000, 0) : f.transcribeElapsed ?? null,
-                                }
-                                : f
-                        ));
-                        break; // 中断后续文件的转录
-                    }
-
-                    if (!response.ok) {
-                        throw new Error(`转录失败: ${file.name}`);
-                    }
-
-                    if (!abortTranscribing) {  // 添加检查，确保没有中断请求
-                        if (file?.transcribeStartAt && file.duration) {
-                            const elapsedSeconds = (Date.now() - file.transcribeStartAt) / 1000;
-                            if (elapsedSeconds > 0) {
-                                averageSpeedRef.current = {
-                                    totalFactor: averageSpeedRef.current.totalFactor + (elapsedSeconds / file.duration),
-                                    count: averageSpeedRef.current.count + 1
-                                };
-                            }
-                        }
-                        setUploadedFiles(prev => {
-                            const newFiles = prev.map(f =>
-                                f.id === fileId ? {
-                                    ...f,
-                                    status: 'done',
-                                    transcription: data.transcription,
-                                    transcribeStartAt: null,
-                                    transcribeProgress: 100,
-                                    transcribeProgressCurrent: f.transcribeProgressDuration ?? f.duration ?? f.transcribeProgressCurrent ?? null,
-                                    transcribeProgressDuration: f.transcribeProgressDuration ?? f.duration ?? null,
-                                    transcribeElapsed: f.transcribeStartAt ? Math.max((Date.now() - f.transcribeStartAt) / 1000, 0) : f.transcribeElapsed ?? null,
-                                } : f
-                            );
-                            return newFiles;
-                        });
-
-                        if (currentFile?.id === fileId) {
-                            setCurrentFile(prev => ({
-                                ...prev,
-                                status: 'done',
-                                transcription: data.transcription,
-                                transcribeStartAt: null,
-                                transcribeProgress: 100,
-                                transcribeProgressCurrent: prev?.transcribeProgressDuration ?? prev?.duration ?? prev?.transcribeProgressCurrent ?? null,
-                                transcribeProgressDuration: prev?.transcribeProgressDuration ?? prev?.duration ?? null,
-                                transcribeElapsed: prev?.transcribeStartAt ? Math.max((Date.now() - prev.transcribeStartAt) / 1000, 0) : prev?.transcribeElapsed ?? null,
-                            }));
-                        }
-                    }
-                } catch (error) {
-                    if (!abortTranscribing) {  // 添加检查，确保没有中断请求
-                        setUploadedFiles(prev => prev.map(f =>
-                            f.id === fileId ? {
-                                ...f,
-                                status: 'error',
-                                transcribeStartAt: null,
-                                transcribeProgress: null,
-                                transcribeProgressCurrent: null,
-                                transcribeProgressDuration: null,
-                                transcribeElapsed: f.transcribeStartAt ? Math.max((Date.now() - f.transcribeStartAt) / 1000, 0) : f.transcribeElapsed ?? null,
-                            } : f
-                        ));
-                        message.error(`文件 "${file.name}" 转录失败：${error.message}`);
-                    }
-                }
+            const response = await fetch('http://localhost:8000/api/transcribe-queue', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fileIds: queue }),
+            });
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                throw new Error(data?.detail || '开始转录失败');
             }
+            message.success('已加入转录队列');
         } catch (error) {
             console.error('Transcription failed:', error);
             message.error('转录失败：' + error.message);
-        } finally {
+            setUploadedFiles(prev => prev.map(f => (
+                queue.includes(f.id) && f.status === 'queued'
+                    ? { ...f, status: 'waiting' }
+                    : f
+            )));
+            setCurrentFile(prev => {
+                if (prev && queue.includes(prev.id) && prev.status === 'queued') {
+                    return { ...prev, status: 'waiting' };
+                }
+                return prev;
+            });
             setIsTranscribing(false);
-            setAbortTranscribing(false);
             message.destroy();
         }
     };
@@ -1348,16 +1628,23 @@ function App() {
         }
 
         try {
-            // 显示导进度
             message.loading('正在导出选中的文件...', 0);
 
-            // 遍历选中的文件
             for (const fileId of fileIds) {
-                const file = uploadedFiles.find(f => f.id === fileId);
+                let file = uploadedFiles.find(f => f.id === fileId);
 
-                // 检查文件是否有转录结果
                 if (!file || !hasTranscription(file)) {
                     message.warning(`文件 "${file?.name}" 没有转录结果，已跳过`);
+                    continue;
+                }
+
+                if (!hasTranscriptionData(file)) {
+                    const refreshed = await ensureTranscriptionLoaded(fileId);
+                    file = refreshed || uploadedFiles.find(f => f.id === fileId);
+                }
+
+                if (!file || !hasTranscriptionData(file)) {
+                    message.warning(`文件 "${file?.name}" 转录内容未加载，已跳过`);
                     continue;
                 }
 
@@ -1665,7 +1952,16 @@ function App() {
             message.warning('请选择需要删除的文件');
             return;
         }
-        const tipContent = `即将删除 ${selectedFiles.length} 个文件，删除后将同时删除关联的总结、详细总结、思维导图、对话内容。`;
+        const selectedRecords = uploadedFiles.filter(file => selectedFiles.includes(file.id));
+        const scannedCount = selectedRecords.filter(isScannedFile).length;
+        const uploadCount = selectedRecords.length - scannedCount;
+        const sourceTip = scannedCount > 0
+            ? `扫描文件 ${scannedCount} 个仅移除记录，不删除原文件。`
+            : '';
+        const uploadTip = uploadCount > 0
+            ? `上传文件 ${uploadCount} 个将从服务端存储中删除。`
+            : '';
+        const tipContent = `即将删除 ${selectedFiles.length} 个文件，删除后将同时删除关联的总结、详细总结、思维导图、对话内容。${sourceTip}${uploadTip}`;
         confirmDeleteWithTip(async () => {
             try {
                 await Promise.all(
@@ -1698,12 +1994,12 @@ function App() {
 
     const transcribedFiles = useMemo(() => (
         uploadedFiles.filter(hasTranscription)
-    ), [uploadedFiles]);
+    ), [uploadedFiles, hasTranscription]);
     const mergedTranscribedFiles = useMemo(() => (
         resultSelection
             .map(id => uploadedFiles.find(file => file.id === id))
-            .filter(file => file && hasTranscription(file))
-    ), [resultSelection, uploadedFiles]);
+            .filter(file => file && hasTranscriptionData(file))
+    ), [resultSelection, uploadedFiles, hasTranscriptionData]);
     const mergedMessages = messagesByFile[mergedChatKey] || emptyMessagesRef.current;
 
     const buildMergedText = (files) => {
@@ -1825,7 +2121,7 @@ function App() {
                                     </div>
                                     {!collapsedTranscriptions.has(fid) && (
                                         <Table
-                                            dataSource={file.transcription.map((item, index) => ({
+                                            dataSource={(Array.isArray(file.transcription) ? file.transcription : []).map((item, index) => ({
                                                 ...item,
                                                 key: index,
                                             }))}
@@ -2200,123 +2496,162 @@ function App() {
         },
     ];
 
+    const previewSection = (
+        <div className="preview-section">
+            {mediaUrl ? (
+                <div className="media-preview">
+                    {mediaUrl.type === 'video' ? (
+                        <div className="video-container">
+                            <video
+                                ref={mediaRef}
+                                src={mediaUrl.url}
+                                controls
+                                className="video-player"
+                            />
+                        </div>
+                    ) : (
+                        <div className="audio-container">
+                            <div className="audio-placeholder">
+                                <SoundOutlined style={{ fontSize: '24px' }} />
+                                <span>音频文件</span>
+                            </div>
+                            <audio
+                                ref={mediaRef}
+                                src={mediaUrl.url}
+                                controls
+                                className="audio-player"
+                            />
+                        </div>
+                    )}
+                </div>
+            ) : null}
+        </div>
+    );
+
+    const fileListSection = (
+        <div className="file-list-section">
+            <div className="section-header">
+                <div className="section-title">
+                    <h3>文件列表</h3>
+                </div>
+                <div className="action-buttons">
+                    <Button
+                        onClick={() => {
+                            const allFileIds = uploadedFiles.map(file => file.id);
+                            setSelectedFiles(allFileIds);
+                        }}
+                    >
+                        全选
+                    </Button>
+                    <Button
+                        onClick={() => setSelectedFiles([])}
+                    >
+                        取消全选
+                    </Button>
+                    <Button
+                        type="primary"
+                        danger
+                        onClick={handleDeleteAll}
+                        disabled={selectedFiles.length === 0 || selectedFiles.some(id =>
+                            uploadedFiles.find(f => f.id === id)?.status === 'transcribing'
+                        )}
+                    >
+                        删除选中
+                    </Button>
+                    <Button
+                        type="primary"
+                        onClick={handleBatchTranscribe}
+                        disabled={selectedFiles.length === 0}
+                        danger={selectedHasActive}
+                    >
+                        {selectedHasActive ? '停止转录' : '开始转录'}
+                    </Button>
+                </div>
+            </div>
+            <Table
+                components={{
+                    header: {
+                        cell: ResizableTitle,
+                    },
+                }}
+                tableLayout="fixed"
+                rowSelection={{
+                    selectedRowKeys: selectedFiles,
+                    onChange: handleFileSelect,
+                    preserveSelectedRowKeys: true,
+                }}
+                dataSource={getPageData()}
+                columns={fileColumns}
+                rowKey="id"
+                size="small"
+                onRow={(record) => ({
+                    onClick: () => handleFilePreview(record),
+                    style: {
+                        cursor: 'pointer',
+                        background: currentFile?.id === record.id ? '#e6f7ff' : 'inherit',
+                    },
+                })}
+                pagination={false}
+            />
+            <div className="pagination-container">
+                <Pagination
+                    {...paginationConfig}
+                    total={uploadedFiles.length}
+                />
+            </div>
+        </div>
+    );
+
     // 修改左侧标签页内容
     const leftTabItems = [
         {
             key: '1',
-            label: '音视频预览',
+            label: '上传文件',
             children: (
                 <div className="tab-content">
-                    <div className="preview-section">
-                        {mediaUrl ? (
-                            <div className="media-preview">
-                                {mediaUrl.type === 'video' ? (
-                                    <div className="video-container">
-                                        <video
-                                            ref={mediaRef}
-                                            src={mediaUrl.url}
-                                            controls
-                                            className="video-player"
-                                        />
-                                    </div>
-                                ) : (
-                                    <div className="audio-container">
-                                        <div className="audio-placeholder">
-                                            <SoundOutlined style={{ fontSize: '24px' }} />
-                                            <span>音频文件</span>
-                                        </div>
-                                        <audio
-                                            ref={mediaRef}
-                                            src={mediaUrl.url}
-                                            controls
-                                            className="audio-player"
-                                        />
-                                    </div>
-                                )}
-                            </div>
-                        ) : (
-                            <div className="upload-placeholder">
-                                <div className="placeholder-content">
-                                    <div className="placeholder-icon">
-                                        <UploadOutlined style={{ fontSize: '48px', color: '#999' }} />
-                                    </div>
-                                    <p>等待上传本地文件</p>
-                                </div>
-                            </div>
-                        )}
-                    </div>
-
-                    <div className="file-list-section">
-                        <div className="section-header">
-                            <div className="section-title">
-                                <h3>文件列表</h3>
-                            </div>
-                            <div className="action-buttons">
-                                <Button
-                                    onClick={() => {
-                                        const allFileIds = uploadedFiles.map(file => file.id);
-                                        setSelectedFiles(allFileIds);
-                                    }}
-                                >
-                                    全选
-                                </Button>
-                                <Button
-                                    onClick={() => setSelectedFiles([])}
-                                >
-                                    取消全选
-                                </Button>
-                                <Button
-                                    type="primary"
-                                    danger
-                                    onClick={handleDeleteAll}
-                                    disabled={selectedFiles.length === 0 || selectedFiles.some(id =>
-                                        uploadedFiles.find(f => f.id === id)?.status === 'transcribing'
-                                    )}
-                                >
-                                    删除选中
-                                </Button>
-                                <Button
-                                    type="primary"
-                                    onClick={handleBatchTranscribe}
-                                    disabled={selectedFiles.length === 0}
-                                    danger={isTranscribing}
-                                >
-                                    {isTranscribing ? '停止转录' : '开始转录'}
-                                </Button>
-                            </div>
+                    <div className="upload-controls">
+                        <Upload
+                            beforeUpload={handleUpload}
+                            accept="video/*,audio/*"
+                            showUploadList={false}
+                            multiple={true}
+                            directory={false}
+                        >
+                            <Button icon={<UploadOutlined />}>
+                                上传本地文件
+                            </Button>
+                        </Upload>
+                        <div className="support-text">
+                            支持多个视频和音频文件格式
                         </div>
-                        <Table
-                            components={{
-                                header: {
-                                    cell: ResizableTitle,
-                                },
-                            }}
-                            tableLayout="fixed"
-                            rowSelection={{
-                                selectedRowKeys: selectedFiles,
-                                onChange: handleFileSelect,
-                                preserveSelectedRowKeys: true,
-                            }}
-                            dataSource={getPageData()} // 使用分页后的数据
-                            columns={fileColumns}
-                            rowKey="id"
-                            size="small"
-                            onRow={(record) => ({
-                                onClick: () => handleFilePreview(record),
-                                style: {
-                                    cursor: 'pointer',
-                                    background: currentFile?.id === record.id ? '#e6f7ff' : 'inherit',
-                                },
-                            })}
-                            pagination={false}
+                    </div>
+                    {previewSection}
+                    {fileListSection}
+                </div>
+            ),
+        },
+        {
+            key: '2',
+            label: '扫描本地文件',
+            children: (
+                <div className="tab-content">
+                    <div className="scan-controls">
+                        <Input
+                            placeholder="输入本地目录路径"
+                            value={scanDirectory}
+                            onChange={(e) => setScanDirectory(e.target.value)}
+                            allowClear
                         />
-                        <div className="pagination-container">
-                            <Pagination
-                                {...paginationConfig}
-                                total={uploadedFiles.length}
-                            />
-                        </div>
+                        <Button
+                            type="primary"
+                            onClick={handleScanDirectory}
+                            loading={scanLoading}
+                        >
+                            扫描
+                        </Button>
                     </div>
+                    {previewSection}
+                    {fileListSection}
                 </div>
             ),
         },
@@ -2338,22 +2673,6 @@ function App() {
                         <GithubOutlined />
                         <span className="author-info">By Airmomo</span>
                     </a>
-                </div>
-                <div className="upload-section">
-                    <Upload
-                        beforeUpload={handleUpload}
-                        accept="video/*,audio/*"
-                        showUploadList={false}
-                        multiple={true}
-                        directory={false}
-                    >
-                        <Button icon={<UploadOutlined />}>
-                            上传本地文件
-                        </Button>
-                    </Upload>
-                </div>
-                <div className="support-text">
-                    支持多个视频和音频文件格式
                 </div>
             </div>
 

@@ -57,6 +57,30 @@
   margin-top: 8px;
 }
 
+.upload-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.upload-controls .support-text {
+  margin-top: 0;
+}
+
+.scan-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.scan-controls .ant-input {
+  max-width: 420px;
+}
+
 /* 主要内容区域 */
 .app-content {
   padding: 12px;
@@ -768,6 +792,40 @@ jmnode.important {
 .transcription-table .ant-table-body {
   height: calc(100% - 40px);
   overflow-y: auto;
+}
+
+.file-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.file-name-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-source-tag {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: #fff7e6;
+  color: #ad6800;
+  font-size: 12px;
+  line-height: 20px;
+}
+
+.file-source-tag.upload {
+  background: #f6ffed;
+  color: #389e0d;
+}
+
+.file-action-buttons {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 /* 上传占位符样式 */
