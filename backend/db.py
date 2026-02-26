@@ -1,11 +1,12 @@
 import sqlite3
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "videochat.db")
+LOCK_STALE_SECONDS = 30
 
 
 def init_db():
@@ -44,6 +45,7 @@ def init_db():
         ensure_transcribe_progress_column(conn)
         ensure_transcribe_progress_current_column(conn)
         ensure_transcribe_progress_duration_column(conn)
+        ensure_transcription_lock_table(conn)
         backfill_file_sizes(conn)
         conn.execute(
             """
@@ -134,6 +136,21 @@ def ensure_transcribe_progress_duration_column(conn):
         conn.execute("ALTER TABLE files ADD COLUMN transcribe_progress_duration REAL")
 
 
+def ensure_transcription_lock_table(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS transcription_lock (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            owner TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO transcription_lock (id, owner, updated_at) VALUES (1, NULL, NULL)"
+    )
+
+
 def backfill_file_sizes(conn):
     rows = conn.execute("SELECT id, stored_name FROM files WHERE file_size IS NULL").fetchall()
     for row in rows:
@@ -141,6 +158,51 @@ def backfill_file_sizes(conn):
         if os.path.exists(file_path):
             size = os.path.getsize(file_path)
             conn.execute("UPDATE files SET file_size = ? WHERE id = ?", (size, row["id"]))
+
+
+def try_acquire_transcription_lock(owner: str) -> bool:
+    conn = get_connection()
+    try:
+        now = datetime.utcnow()
+        now_value = now.isoformat()
+        stale_before = (now - timedelta(seconds=LOCK_STALE_SECONDS)).isoformat()
+        cursor = conn.execute(
+            """
+            UPDATE transcription_lock
+            SET owner = ?, updated_at = ?
+            WHERE id = 1 AND (owner IS NULL OR owner = ? OR updated_at IS NULL OR updated_at <= ?)
+            """,
+            (owner, now_value, owner, stale_before),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def touch_transcription_lock(owner: str) -> None:
+    conn = get_connection()
+    try:
+        now = datetime.utcnow().isoformat()
+        conn.execute(
+            "UPDATE transcription_lock SET updated_at = ? WHERE id = 1 AND owner = ?",
+            (now, owner),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def release_transcription_lock(owner: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE transcription_lock SET owner = NULL, updated_at = NULL WHERE id = 1 AND owner = ?",
+            (owner,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def row_to_file(row, include_transcription: bool = True):
@@ -176,11 +238,15 @@ def row_to_file(row, include_transcription: bool = True):
     }
 
 
-def list_files(include_transcription: bool = True):
+def list_files(page: int = 1, page_size: int = 10, include_transcription: bool = True):
     conn = get_connection()
     try:
+        offset = max(page - 1, 0) * page_size
         if include_transcription:
-            rows = conn.execute("SELECT * FROM files ORDER BY created_at ASC").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM files ORDER BY created_at ASC LIMIT ? OFFSET ?",
+                (page_size, offset),
+            ).fetchall()
             return [row_to_file(row, include_transcription=True) for row in rows]
         rows = conn.execute(
             """
@@ -192,9 +258,21 @@ def list_files(include_transcription: bool = True):
                 CASE WHEN transcription IS NOT NULL AND LENGTH(transcription) > 0 THEN 1 ELSE 0 END AS has_transcription
             FROM files
             ORDER BY created_at ASC
+            LIMIT ? OFFSET ?
             """
+            ,
+            (page_size, offset),
         ).fetchall()
         return [row_to_file(row, include_transcription=False) for row in rows]
+    finally:
+        conn.close()
+
+
+def count_files():
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT COUNT(1) AS total FROM files").fetchone()
+        return int(row["total"] if row and row["total"] is not None else 0)
     finally:
         conn.close()
 

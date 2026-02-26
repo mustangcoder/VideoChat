@@ -18,7 +18,8 @@ from backend.models import ChatMessage, ChatRequest
 import asyncio
 import uuid
 import json
-from backend.db import init_db, list_files, get_file, insert_file, update_file, delete_file_with_related, get_merged_summary, upsert_merged_summary, get_merged_detailed_summary, upsert_merged_detailed_summary, find_duplicate_file, find_file_by_path, get_merged_mindmap, upsert_merged_mindmap, get_chat_history, upsert_chat_history, get_next_queued_file, update_status_by_status
+from backend.db import init_db, list_files, count_files, get_file, insert_file, update_file, delete_file_with_related, get_merged_summary, upsert_merged_summary, get_merged_detailed_summary, upsert_merged_detailed_summary, find_duplicate_file, find_file_by_path, get_merged_mindmap, upsert_merged_mindmap, get_chat_history, upsert_chat_history, get_next_queued_file, update_status_by_status, try_acquire_transcription_lock, release_transcription_lock, touch_transcription_lock
+import math
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("videochat")
@@ -232,10 +233,8 @@ def clear_transcribe_timer(file_id: str):
 async def process_transcribe_queue():
     global queue_task
     try:
+        logger.info("queue_start")
         while True:
-            if transcription_task and not transcription_task.cancelled():
-                await asyncio.sleep(0.5)
-                continue
             next_file = get_next_queued_file()
             if not next_file:
                 break
@@ -243,13 +242,21 @@ async def process_transcribe_queue():
             if not file_id:
                 break
             try:
+                logger.info("queue_dequeue file_id=%s", file_id)
                 await transcribe_file(file_id)
-            except HTTPException:
+            except HTTPException as exc:
+                if getattr(exc, "detail", None) == "Another transcription is running":
+                    logger.info("queue_lock_busy file_id=%s", file_id)
+                    await asyncio.sleep(0.5)
+                    continue
+                logger.warning("queue_transcribe_http_error file_id=%s detail=%s", file_id, getattr(exc, "detail", None))
                 update_file(file_id, {"status": "error"})
             except Exception:
+                logger.exception("queue_transcribe_error file_id=%s", file_id)
                 update_file(file_id, {"status": "error"})
                 await asyncio.sleep(0)
     finally:
+        logger.info("queue_stop")
         queue_task = None
 
 
@@ -257,6 +264,7 @@ async def ensure_queue_worker():
     global queue_task
     async with queue_lock:
         if queue_task is None or queue_task.done():
+            logger.info("queue_worker_spawn")
             queue_task = asyncio.create_task(process_transcribe_queue())
 
 class TextRequest(BaseModel):
@@ -294,6 +302,8 @@ class ScanRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     init_db()
+    update_status_by_status("transcribing", "interrupted")
+    logger.info("startup_queue_bootstrap")
     await ensure_queue_worker()
 
 @app.post("/api/upload")
@@ -340,8 +350,22 @@ async def upload_file(file: UploadFile = File(...)):
 
 
 @app.get("/api/files")
-async def get_files():
-    return {"files": list_files(include_transcription=False)}
+async def get_files(page: int = 1, page_size: int = 10, pageSize: Optional[int] = None):
+    effective_page_size = pageSize if pageSize is not None else page_size
+    if page < 1 or effective_page_size < 1:
+        raise HTTPException(status_code=400, detail="Invalid pagination parameters")
+    total = count_files()
+    files = list_files(page=page, page_size=effective_page_size, include_transcription=False)
+    total_pages = math.ceil(total / effective_page_size) if total > 0 else 0
+    return {
+        "files": files,
+        "pagination": {
+            "page": page,
+            "pageSize": effective_page_size,
+            "total": total,
+            "totalPages": total_pages,
+        },
+    }
 
 
 @app.post("/api/transcribe-queue")
@@ -574,6 +598,11 @@ async def transcribe_file(file_id: str):
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found on disk")
 
+    lock_acquired = try_acquire_transcription_lock(file_id)
+    if not lock_acquired:
+        logger.info("transcribe_lock_busy file_id=%s", file_id)
+        raise HTTPException(status_code=400, detail="Another transcription is running")
+
     existing_transcription = file_record.get("transcription")
     resume_offset = None
     if isinstance(existing_transcription, list) and existing_transcription:
@@ -594,6 +623,7 @@ async def transcribe_file(file_id: str):
     elapsed_base = existing_elapsed if isinstance(existing_elapsed, (int, float)) else 0.0
     set_transcribe_timer(file_id, elapsed_base, time.monotonic())
 
+    logger.info("transcribe_start file_id=%s path=%s offset=%s", file_id, file_path, resume_offset)
     update_file(file_id, {
         "status": "transcribing",
         "transcribe_elapsed": elapsed_base,
@@ -615,6 +645,7 @@ async def transcribe_file(file_id: str):
         if elapsed_value is not None:
             fields["transcribe_elapsed"] = elapsed_value
         update_file(file_id, fields)
+        touch_transcription_lock(file_id)
 
     transcription_task = asyncio.create_task(transcribe_audio(
         file_path,
@@ -634,6 +665,7 @@ async def transcribe_file(file_id: str):
             "transcription": json.dumps(transcription),
             "transcribe_elapsed": elapsed,
         })
+        logger.info("transcribe_done file_id=%s elapsed=%s", file_id, elapsed)
         return {"transcription": transcription}
     except asyncio.CancelledError:
         if not transcription_task.cancelled():
@@ -643,6 +675,7 @@ async def transcribe_file(file_id: str):
         elapsed = pause_transcribe_timer(file_id)
         clear_transcribe_timer(file_id)
         update_file(file_id, {"status": "interrupted", "transcribe_elapsed": elapsed})
+        logger.info("transcribe_cancelled file_id=%s elapsed=%s", file_id, elapsed)
         return JSONResponse(
             status_code=499,
             content={"status": "interrupted", "detail": "Transcription interrupted"}
@@ -655,7 +688,11 @@ async def transcribe_file(file_id: str):
         elapsed = pause_transcribe_timer(file_id)
         clear_transcribe_timer(file_id)
         update_file(file_id, {"status": "error", "transcribe_elapsed": elapsed})
+        logger.exception("transcribe_error file_id=%s", file_id)
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        if lock_acquired:
+            release_transcription_lock(file_id)
 
 
 @app.post("/api/files/{file_id}/pause")
@@ -682,6 +719,8 @@ async def pause_file_transcription(file_id: str):
     elapsed = pause_transcribe_timer(file_id) if running else file_record.get("transcribeElapsed")
     if running:
         pause_transcription()
+        release_transcription_lock(file_id)
+    logger.info("transcribe_pause file_id=%s running=%s elapsed=%s", file_id, running, elapsed)
     update_file(file_id, {"status": "paused", "transcribe_elapsed": elapsed})
     stored_progress = file_record.get("transcribeProgress")
     stored_current = file_record.get("transcribeProgressCurrent")
@@ -707,15 +746,36 @@ async def resume_file_transcription(file_id: str, background_tasks: BackgroundTa
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found on disk")
     running = current_transcribing_id == file_id or is_file_being_transcribed(file_path)
+    if not running:
+        progress = get_transcription_progress(file_path)
+        if isinstance(progress, dict) and progress.get("status") in {"paused", "transcribing"}:
+            current_transcribing_id = file_id
+            running = True
     if running:
         elapsed = resume_transcribe_timer(file_id)
         resume_transcription()
         update_file(file_id, {"status": "transcribing", "transcribe_elapsed": elapsed})
+        logger.info("transcribe_resume file_id=%s elapsed=%s", file_id, elapsed)
         return {"message": "Transcription resumed"}
-    if transcription_task and not transcription_task.cancelled():
+    lock_acquired = try_acquire_transcription_lock(file_id)
+    if not lock_acquired:
+        logger.info("transcribe_restart_lock_busy file_id=%s", file_id)
         raise HTTPException(status_code=400, detail="Another transcription is running")
     async def restart():
-        await transcribe_file(file_id)
+        logger.info("transcribe_restart file_id=%s", file_id)
+        try:
+            await transcribe_file(file_id)
+        except HTTPException as exc:
+            if getattr(exc, "detail", None) == "Another transcription is running":
+                update_file(file_id, {"status": "paused"})
+            else:
+                update_file(file_id, {"status": "error"})
+        except Exception:
+            update_file(file_id, {"status": "error"})
+        finally:
+            if lock_acquired:
+                release_transcription_lock(file_id)
+            logger.info("transcribe_restart_done file_id=%s", file_id)
     background_tasks.add_task(restart)
     return {"message": "Transcription restarted"}
 
@@ -935,6 +995,7 @@ async def export_transcription(format: str, transcription: List[dict]):
 async def stop_transcribe():
     global transcription_task, current_transcribing_id, queue_task
     try:
+        logger.info("transcribe_stop_request")
         # 先设置停止标志
         stop_transcription()
         
@@ -950,12 +1011,15 @@ async def stop_transcribe():
             elapsed = pause_transcribe_timer(current_transcribing_id)
             update_file(current_transcribing_id, {"status": "interrupted", "transcribe_elapsed": elapsed})
             clear_transcribe_timer(current_transcribing_id)
+            release_transcription_lock(current_transcribing_id)
             current_transcribing_id = None
         update_status_by_status("queued", "waiting")
         if queue_task and not queue_task.done():
             queue_task.cancel()
             queue_task = None
             
+        logger.info("transcribe_stop_done")
         return {"message": "Transcription stopped"}
     except Exception as e:
+        logger.exception("transcribe_stop_error")
         raise HTTPException(status_code=500, detail=str(e)) 

@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Layout, Upload, Button, Input, Card, message, Table, Tabs, Pagination, Checkbox, Modal } from 'antd';
-import { UploadOutlined, SendOutlined, SoundOutlined, DownloadOutlined, CopyOutlined, StopOutlined, DeleteOutlined, GithubOutlined, ArrowUpOutlined, ArrowDownOutlined, PauseOutlined, PlayCircleOutlined } from '@ant-design/icons';
+import { UploadOutlined, SendOutlined, SoundOutlined, DownloadOutlined, CopyOutlined, StopOutlined, DeleteOutlined, GithubOutlined, ArrowUpOutlined, ArrowDownOutlined, PauseOutlined, PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import Mermaid from 'mermaid';
 import './App.css';
@@ -96,7 +96,7 @@ const MindmapContent = React.memo(({ fileId, content, isLoading }) => {
     return <div id={containerId} className="mindmap-container" />;
 });
 
-const ResultFileSelector = React.memo(({ files, selectedIds, onToggle, onMove }) => {
+const ResultFileSelector = React.memo(({ files, selectedIds, onToggle, onMove, onRefresh, refreshingIds }) => {
     if (files.length === 0) {
         return (
             <div className="empty-state">
@@ -126,6 +126,16 @@ const ResultFileSelector = React.memo(({ files, selectedIds, onToggle, onMove })
                                 {file.name}
                             </Checkbox>
                             <div className="result-selector-actions">
+                                <Button
+                                    size="small"
+                                    icon={<ReloadOutlined />}
+                                    onClick={() => onRefresh(file.id)}
+                                    loading={refreshingIds?.has(file.id)}
+                                    disabled={refreshingIds?.has(file.id)}
+                                    type="text"
+                                    aria-label="刷新"
+                                    title="刷新"
+                                />
                                 <Button
                                     size="small"
                                     icon={<ArrowUpOutlined />}
@@ -226,8 +236,9 @@ function App() {
     const [selectedFiles, setSelectedFiles] = useState([]);  // 存储选中的文件
     const [currentFile, setCurrentFile] = useState(null);    // 当前预览的文件
     const [resultSelection, setResultSelection] = useState([]);
-    const [pageSize, setPageSize] = useState(5); // 默认每页显示5个文件
+    const [pageSize, setPageSize] = useState(10); // 默认每页显示5个文件
     const [currentPage, setCurrentPage] = useState(1); // 添加当前页码状态
+    const [totalFiles, setTotalFiles] = useState(0);
     const [abortTranscribing, setAbortTranscribing] = useState(false); // 添加停止转录状态
     const [mindmapLoadingFiles, setMindmapLoadingFiles] = useState(new Set());
     const [summaryLoadingFiles, setSummaryLoadingFiles] = useState(new Set());
@@ -248,6 +259,8 @@ function App() {
     const [activeMediaTab, setActiveMediaTab] = useState('1');
     const [scanDirectory, setScanDirectory] = useState('');
     const [scanLoading, setScanLoading] = useState(false);
+    const [fileListLoading, setFileListLoading] = useState(false);
+    const [refreshingResultIds, setRefreshingResultIds] = useState(new Set());
     const [fileColumnWidths, setFileColumnWidths] = useState({
         name: 420,
         type: 120,
@@ -291,18 +304,32 @@ function App() {
     }, [hasTranscriptionData]);
 
     const loadFiles = useCallback(async () => {
+        setFileListLoading(true);
         try {
-            const response = await fetch('http://localhost:8000/api/files');
+            const params = new URLSearchParams({
+                page: String(currentPage),
+                pageSize: String(pageSize),
+            });
+            const response = await fetch(`http://localhost:8000/api/files?${params.toString()}`);
             if (!response.ok) {
                 throw new Error('加载文件列表失败');
             }
             const data = await response.json();
             const files = (data.files || []).map(file => normalizeFile(file));
             setUploadedFiles(files);
+            const pagination = data?.pagination || {};
+            const total = typeof pagination.total === 'number' ? pagination.total : files.length;
+            setTotalFiles(total);
+            const totalPages = typeof pagination.totalPages === 'number' ? pagination.totalPages : 0;
+            if (totalPages > 0 && currentPage > totalPages) {
+                setCurrentPage(totalPages);
+            }
         } catch (error) {
             console.error('Failed to load files:', error);
+        } finally {
+            setFileListLoading(false);
         }
-    }, [normalizeFile]);
+    }, [normalizeFile, currentPage, pageSize]);
 
     useEffect(() => {
         loadFiles();
@@ -354,71 +381,6 @@ function App() {
         }, 2000);
         return () => clearInterval(timer);
     }, [transcribingKey]);
-
-    useEffect(() => {
-        if (!transcribingKey) {
-            return;
-        }
-        let stopped = false;
-        const fetchProgress = async () => {
-            const ids = transcribingKey.split('|').filter(Boolean);
-            if (ids.length === 0) {
-                return;
-            }
-            const progressList = await Promise.all(ids.map(async (fileId) => {
-                try {
-                    const response = await fetch(`http://localhost:8000/api/files/${fileId}`);
-                    if (!response.ok) {
-                        return null;
-                    }
-                    const data = await response.json();
-                    return { fileId, data };
-                } catch (error) {
-                    return null;
-                }
-            }));
-            if (stopped) {
-                return;
-            }
-            const progressMap = new Map();
-            progressList.forEach(item => {
-                if (!item?.fileId || !item?.data) return;
-                progressMap.set(item.fileId, item.data);
-            });
-            if (progressMap.size === 0) {
-                return;
-            }
-            setUploadedFiles(prev => {
-                let changed = false;
-                const next = prev.map(file => {
-                    const update = progressMap.get(file.id);
-                    if (!update) return file;
-                    if (update.updatedAt && file.updatedAt && update.updatedAt === file.updatedAt) {
-                        return file;
-                    }
-                    const normalized = normalizeFile(update, file);
-                    changed = true;
-                    return normalized;
-                });
-                return changed ? next : prev;
-            });
-            setCurrentFile(prev => {
-                if (!prev) return prev;
-                const update = progressMap.get(prev.id);
-                if (!update) return prev;
-                if (update.updatedAt && prev.updatedAt && update.updatedAt === prev.updatedAt) {
-                    return prev;
-                }
-                return normalizeFile(update, prev);
-            });
-        };
-        fetchProgress();
-        const timer = setInterval(fetchProgress, 3000);
-        return () => {
-            stopped = true;
-            clearInterval(timer);
-        };
-    }, [transcribingKey, normalizeFile]);
 
     useEffect(() => {
         if (isTranscribing && !hasActiveQueue) {
@@ -481,15 +443,6 @@ function App() {
         });
     }, [uploadedFiles, currentFile, hasTranscription]);
 
-    useEffect(() => {
-        resultSelection.forEach(fileId => {
-            const file = uploadedFiles.find(item => item.id === fileId);
-            if (file?.hasTranscription && !hasTranscriptionData(file)) {
-                ensureTranscriptionLoaded(fileId);
-            }
-        });
-    }, [resultSelection, uploadedFiles, hasTranscriptionData, ensureTranscriptionLoaded]);
-
     const mergedSelectionKey = useMemo(() => resultSelection.join('|'), [resultSelection]);
     const mergedChatKey = useMemo(() => (
         mergedSelectionKey ? `merged:${mergedSelectionKey}` : ''
@@ -497,9 +450,7 @@ function App() {
 
     useEffect(() => {
         setMergedSummary('');
-        setMergedDetailedSummary('');
-        setMergedMindmapData(null);
-        if (!mergedSelectionKey) {
+        if (!mergedSelectionKey || activeFeatureTab !== '2') {
             return;
         }
         fetch(`http://localhost:8000/api/merged-summary/${encodeURIComponent(mergedSelectionKey)}`)
@@ -515,6 +466,13 @@ function App() {
                 }
             })
             .catch(() => {});
+    }, [mergedSelectionKey, activeFeatureTab]);
+
+    useEffect(() => {
+        setMergedDetailedSummary('');
+        if (!mergedSelectionKey || activeFeatureTab !== '3') {
+            return;
+        }
         fetch(`http://localhost:8000/api/merged-detailed-summary/${encodeURIComponent(mergedSelectionKey)}`)
             .then(response => {
                 if (!response.ok) {
@@ -528,6 +486,13 @@ function App() {
                 }
             })
             .catch(() => {});
+    }, [mergedSelectionKey, activeFeatureTab]);
+
+    useEffect(() => {
+        setMergedMindmapData(null);
+        if (!mergedSelectionKey || activeFeatureTab !== '4') {
+            return;
+        }
         fetch(`http://localhost:8000/api/merged-mindmap/${encodeURIComponent(mergedSelectionKey)}`)
             .then(response => {
                 if (!response.ok) {
@@ -541,7 +506,7 @@ function App() {
                 }
             })
             .catch(() => {});
-    }, [mergedSelectionKey]);
+    }, [mergedSelectionKey, activeFeatureTab]);
 
     const handleUpload = async (file) => {
         // 检查文件类型
@@ -669,11 +634,7 @@ function App() {
         },
     };
 
-    const pageData = useMemo(() => {
-        const start = (currentPage - 1) * pageSize;
-        const end = start + pageSize;
-        return uploadedFiles.slice(start, end);
-    }, [currentPage, pageSize, uploadedFiles]);
+    const pageData = useMemo(() => uploadedFiles, [uploadedFiles]);
 
     const formatDuration = (seconds) => {
         const safeSeconds = Math.max(0, Math.floor(seconds || 0));
@@ -1440,13 +1401,16 @@ function App() {
     };
 
     useEffect(() => {
+        if (activeFeatureTab !== '5') {
+            return;
+        }
         if (mergedChatKey) {
             loadChatHistory(mergedChatKey);
         }
         resultSelection.forEach(id => {
             loadChatHistory(id);
         });
-    }, [mergedChatKey, resultSelection]);
+    }, [mergedChatKey, resultSelection, activeFeatureTab]);
 
     // 修改发送消息函数
     const handleSendMessage = async (targetId, contextText) => {
@@ -1679,6 +1643,24 @@ function App() {
             message.destroy(); // 清除loading息
         }
     };
+
+    const handleRefreshResultFile = useCallback(async (fileId) => {
+        setRefreshingResultIds(prev => new Set([...prev, fileId]));
+        try {
+            const data = await fetchFileDetails(fileId);
+            if (data) {
+                setCurrentFile(prev => prev?.id === fileId ? normalizeFile(data, prev) : prev);
+            }
+        } catch (error) {
+            message.error('刷新失败');
+        } finally {
+            setRefreshingResultIds(prev => {
+                const next = new Set(prev);
+                next.delete(fileId);
+                return next;
+            });
+        }
+    }, [fetchFileDetails, normalizeFile]);
 
     // 修改详细总结函数
     const handleDetailedSummary = async (fileId) => {
@@ -2081,6 +2063,8 @@ function App() {
                         selectedIds={resultSelection}
                         onToggle={handleToggleResultSelection}
                         onMove={handleMoveResultSelection}
+                        onRefresh={handleRefreshResultFile}
+                        refreshingIds={refreshingResultIds}
                     />
                     {resultSelection.length === 0 ? (
                         <div className="empty-state">
@@ -2132,6 +2116,8 @@ function App() {
                         selectedIds={resultSelection}
                         onToggle={handleToggleResultSelection}
                         onMove={handleMoveResultSelection}
+                        onRefresh={handleRefreshResultFile}
+                        refreshingIds={refreshingResultIds}
                     />
                     {resultSelection.length === 0 ? (
                         <div className="empty-state">
@@ -2225,6 +2211,8 @@ function App() {
                         selectedIds={resultSelection}
                         onToggle={handleToggleResultSelection}
                         onMove={handleMoveResultSelection}
+                        onRefresh={handleRefreshResultFile}
+                        refreshingIds={refreshingResultIds}
                     />
                     {resultSelection.length === 0 ? (
                         <div className="empty-state">
@@ -2318,6 +2306,8 @@ function App() {
                         selectedIds={resultSelection}
                         onToggle={handleToggleResultSelection}
                         onMove={handleMoveResultSelection}
+                        onRefresh={handleRefreshResultFile}
+                        refreshingIds={refreshingResultIds}
                     />
                     {resultSelection.length === 0 ? (
                         <div className="empty-state">
@@ -2397,6 +2387,8 @@ function App() {
                         selectedIds={resultSelection}
                         onToggle={handleToggleResultSelection}
                         onMove={handleMoveResultSelection}
+                        onRefresh={handleRefreshResultFile}
+                        refreshingIds={refreshingResultIds}
                     />
                     {resultSelection.length === 0 ? (
                         <div className="empty-state">
@@ -2560,6 +2552,7 @@ function App() {
                     },
                 }}
                 tableLayout="fixed"
+                loading={fileListLoading}
                 rowSelection={{
                     selectedRowKeys: selectedFiles,
                     onChange: handleFileSelect,
@@ -2581,7 +2574,8 @@ function App() {
             <div className="pagination-container">
                 <Pagination
                     {...paginationConfig}
-                    total={uploadedFiles.length}
+                    total={totalFiles}
+                    disabled={fileListLoading}
                 />
             </div>
         </div>
