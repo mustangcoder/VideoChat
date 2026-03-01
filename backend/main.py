@@ -760,7 +760,9 @@ async def resume_file_transcription(file_id: str, background_tasks: BackgroundTa
     lock_acquired = try_acquire_transcription_lock(file_id)
     if not lock_acquired:
         logger.info("transcribe_restart_lock_busy file_id=%s", file_id)
-        raise HTTPException(status_code=400, detail="Another transcription is running")
+        update_file(file_id, {"status": "queued"})
+        await ensure_queue_worker()
+        return {"message": "Transcription queued", "status": "queued"}
     async def restart():
         logger.info("transcribe_restart file_id=%s", file_id)
         try:
@@ -785,11 +787,15 @@ async def get_transcribe_progress(file_id: str):
     file_record = get_file(file_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="File not found")
+    elapsed_value = get_transcribe_elapsed(file_id)
+    if elapsed_value is None:
+        elapsed_value = file_record.get("transcribeElapsed")
     return {
         "progress": file_record.get("transcribeProgress"),
         "duration": file_record.get("transcribeProgressDuration"),
         "current": file_record.get("transcribeProgressCurrent"),
         "status": file_record.get("status"),
+        "elapsed": elapsed_value,
     }
 
 
@@ -953,40 +959,69 @@ def format_timestamp(seconds, srt=False):
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{msecs:03d}"
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{msecs:03d}"
 
+def build_transcription_content(format: str, transcription: List[dict]):
+    if format == "vtt":
+        return generate_vtt(transcription), "text/vtt"
+    if format == "srt":
+        return generate_srt(transcription), "application/x-subrip"
+    if format == "txt":
+        return generate_txt(transcription), "text/plain"
+    raise HTTPException(status_code=400, detail="Unsupported format")
+
+@app.post("/api/files/{file_id}/export/{format}")
+async def export_transcription_by_file(file_id: str, format: str):
+    file_record = get_file(file_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File not found")
+    transcription = file_record.get("transcription")
+    if not transcription:
+        raise HTTPException(status_code=400, detail="No transcription data provided")
+    content, mime_type = build_transcription_content(format, transcription)
+    file_path = resolve_file_path(file_record)
+    if file_path and os.path.isabs(file_path) and not is_uploads_path(file_path):
+        base_dir = os.path.dirname(file_path)
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        filename = f"{base_name}_transcription.{format}"
+        output_path = os.path.join(base_dir, filename)
+        if os.path.exists(output_path):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{base_name}_transcription_{timestamp}.{format}"
+            output_path = os.path.join(base_dir, filename)
+        with open(output_path, "wb") as output_file:
+            output_file.write(content.encode("utf-8"))
+        return {"savedPath": output_path, "filename": filename}
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{format}") as temp_file:
+            temp_file.write(content.encode("utf-8"))
+            temp_file.flush()
+            base_name = os.path.splitext(file_record.get("name") or "transcription")[0]
+            filename = f"{base_name}_transcription.{format}"
+            return FileResponse(
+                path=temp_file.name,
+                filename=filename,
+                media_type=mime_type,
+                background=None
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/export/{format}")
 async def export_transcription(format: str, transcription: List[dict]):
     if not transcription:
         raise HTTPException(status_code=400, detail="No transcription data provided")
     
     try:
-        # 创建临时文件
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{format}") as temp_file:
-            content = ""
-            if format == "vtt":
-                content = generate_vtt(transcription)
-                mime_type = "text/vtt"
-            elif format == "srt":
-                content = generate_srt(transcription)
-                mime_type = "application/x-subrip"
-            elif format == "txt":
-                content = generate_txt(transcription)
-                mime_type = "text/plain"
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported format")
-            
+            content, mime_type = build_transcription_content(format, transcription)
             temp_file.write(content.encode('utf-8'))
             temp_file.flush()
-            
-            # 生成文件名
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"transcription_{timestamp}.{format}"
-            
-            # 返回文件
             return FileResponse(
                 path=temp_file.name,
                 filename=filename,
                 media_type=mime_type,
-                background=None  # 立即发送文件
+                background=None
             )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

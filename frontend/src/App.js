@@ -105,16 +105,10 @@ const ResultFileSelector = React.memo(({ files, selectedIds, onToggle, onMove, o
         );
     }
 
-    const selectedSet = new Set(selectedIds);
-    const orderedFiles = [
-        ...selectedIds.map(id => files.find(file => file.id === id)).filter(Boolean),
-        ...files.filter(file => !selectedSet.has(file.id)),
-    ];
-
     return (
         <div className="result-selector">
             <div className="result-selector-list">
-                {orderedFiles.map(file => {
+                {files.map(file => {
                     const selectedIndex = selectedIds.indexOf(file.id);
                     const isSelected = selectedIndex !== -1;
                     return (
@@ -358,6 +352,49 @@ function App() {
         }
     }, [normalizeFile]);
 
+    const refreshTranscribingProgress = useCallback(async (fileIds) => {
+        const targets = (fileIds || []).filter(Boolean);
+        if (targets.length === 0) return;
+        await Promise.all(targets.map(async (fileId) => {
+            try {
+                const response = await fetch(`http://localhost:8000/api/files/${fileId}/transcribe-progress`);
+                if (!response.ok) {
+                    return;
+                }
+                const data = await response.json().catch(() => ({}));
+                const progressValue = typeof data.progress === 'number' ? data.progress : null;
+                const currentValue = typeof data.current === 'number' ? data.current : null;
+                const durationValue = typeof data.duration === 'number' ? data.duration : null;
+                const statusValue = typeof data.status === 'string' ? data.status : null;
+                const elapsedValue = typeof data.elapsed === 'number' ? data.elapsed : null;
+                const nextStartAt = statusValue === 'transcribing' ? Date.now() : null;
+                setUploadedFiles(prev => prev.map(file => file.id === fileId ? {
+                    ...file,
+                    status: statusValue || file.status,
+                    transcribeStartAt: nextStartAt ?? (statusValue && statusValue !== 'transcribing' ? null : file.transcribeStartAt),
+                    transcribeProgress: progressValue ?? file.transcribeProgress,
+                    transcribeProgressCurrent: currentValue ?? file.transcribeProgressCurrent,
+                    transcribeProgressDuration: durationValue ?? file.transcribeProgressDuration,
+                    transcribeElapsed: elapsedValue ?? file.transcribeElapsed,
+                } : file));
+                setCurrentFile(prev => prev?.id === fileId ? {
+                    ...prev,
+                    status: statusValue || prev.status,
+                    transcribeStartAt: nextStartAt ?? (statusValue && statusValue !== 'transcribing' ? null : prev.transcribeStartAt),
+                    transcribeProgress: progressValue ?? prev.transcribeProgress,
+                    transcribeProgressCurrent: currentValue ?? prev.transcribeProgressCurrent,
+                    transcribeProgressDuration: durationValue ?? prev.transcribeProgressDuration,
+                    transcribeElapsed: elapsedValue ?? prev.transcribeElapsed,
+                } : prev);
+                if (statusValue && statusValue !== 'transcribing') {
+                    await fetchFileDetails(fileId);
+                }
+            } catch (error) {
+                console.error('Failed to refresh transcribe progress:', error);
+            }
+        }));
+    }, [fetchFileDetails]);
+
     const ensureTranscriptionLoaded = useCallback(async (fileId) => {
         const file = uploadedFiles.find(item => item.id === fileId);
         if (!file) return null;
@@ -378,9 +415,21 @@ function App() {
         }
         const timer = setInterval(() => {
             setNow(Date.now());
-        }, 2000);
+        }, 5000);
         return () => clearInterval(timer);
     }, [transcribingKey]);
+
+    useEffect(() => {
+        if (!transcribingKey) {
+            return undefined;
+        }
+        const refresh = () => {
+            refreshTranscribingProgress(transcribingIds);
+        };
+        refresh();
+        const timer = setInterval(refresh, 5000);
+        return () => clearInterval(timer);
+    }, [transcribingKey, transcribingIds, refreshTranscribingProgress]);
 
     useEffect(() => {
         if (isTranscribing && !hasActiveQueue) {
@@ -1016,19 +1065,21 @@ function App() {
             const response = await fetch(`http://localhost:8000/api/files/${fileId}/resume`, {
                 method: 'POST',
             });
+            const data = await response.json().catch(() => ({}));
             if (!response.ok) {
-                const data = await response.json().catch(() => ({}));
                 throw new Error(data?.detail || '继续失败');
             }
+            const nextStatus = data?.status === 'queued' ? 'queued' : 'transcribing';
+            const nextStartAt = nextStatus === 'transcribing' ? Date.now() : null;
             setUploadedFiles(prev => prev.map(file => file.id === fileId ? {
                 ...file,
-                status: 'transcribing',
-                transcribeStartAt: Date.now(),
+                status: nextStatus,
+                transcribeStartAt: nextStartAt,
             } : file));
             setCurrentFile(prev => prev?.id === fileId ? {
                 ...prev,
-                status: 'transcribing',
-                transcribeStartAt: Date.now(),
+                status: nextStatus,
+                transcribeStartAt: nextStartAt,
             } : prev);
         } catch (error) {
             console.error('Resume failed:', error);
@@ -1041,20 +1092,22 @@ function App() {
             const response = await fetch(`http://localhost:8000/api/files/${fileId}/resume`, {
                 method: 'POST',
             });
+            const data = await response.json().catch(() => ({}));
             if (!response.ok) {
-                const data = await response.json().catch(() => ({}));
                 throw new Error(data?.detail || '继续失败');
             }
+            const nextStatus = data?.status === 'queued' ? 'queued' : 'transcribing';
+            const nextStartAt = nextStatus === 'transcribing' ? Date.now() : null;
             setUploadedFiles(prev => prev.map(file => file.id === fileId ? {
                 ...file,
-                status: 'transcribing',
-                transcribeStartAt: Date.now(),
+                status: nextStatus,
+                transcribeStartAt: nextStartAt,
                 transcribeElapsed: typeof file.transcribeElapsed === 'number' ? file.transcribeElapsed : 0,
             } : file));
             setCurrentFile(prev => prev?.id === fileId ? {
                 ...prev,
-                status: 'transcribing',
-                transcribeStartAt: Date.now(),
+                status: nextStatus,
+                transcribeStartAt: nextStartAt,
                 transcribeElapsed: typeof prev.transcribeElapsed === 'number' ? prev.transcribeElapsed : 0,
             } : prev);
         } catch (error) {
@@ -1587,24 +1640,24 @@ function App() {
                     continue;
                 }
 
-                if (!hasTranscriptionData(file)) {
-                    const refreshed = await ensureTranscriptionLoaded(fileId);
-                    file = refreshed || uploadedFiles.find(f => f.id === fileId);
-                }
-
-                if (!file || !hasTranscriptionData(file)) {
-                    message.warning(`文件 "${file?.name}" 转录内容未加载，已跳过`);
-                    continue;
-                }
-
                 try {
-                    const response = await fetch(`http://localhost:8000/api/export/${format}`, {
+                    const response = await fetch(`http://localhost:8000/api/files/${fileId}/export/${format}`, {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify(file.transcription),
                     });
+
+                    const contentType = response.headers.get('content-type') || '';
+                    if (contentType.includes('application/json')) {
+                        const data = await response.json().catch(() => ({}));
+                        if (!response.ok) {
+                            throw new Error(data?.detail || `导出失败: ${file.name}`);
+                        }
+                        if (data?.savedPath) {
+                            message.success(`文件 "${file.name}" 已保存到 ${data.savedPath}`);
+                        } else {
+                            message.success(`文件 "${file.name}" 导出成功`);
+                        }
+                        continue;
+                    }
 
                     if (!response.ok) {
                         throw new Error(`导出失败: ${file.name}`);
